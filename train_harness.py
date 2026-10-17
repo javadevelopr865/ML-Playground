@@ -13,7 +13,7 @@
 import torch
 import torch.nn as nn
 import torchmetrics
-import time, secrets, warnings
+import time, secrets, warnings, contextlib
 
 class Initializer:
     @staticmethod
@@ -138,16 +138,35 @@ class Trainer:
             anneal_strategy='cos'
             ):
         steps_per_epoch = len(self.train_dataloader)
-        self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr = max_lr, pct_start=pct_start,
-                              anneal_strategy=anneal_strategy, epochs=n_epochs, steps_per_epoch=steps_per_epoch)
-        self._step_per_batch = True
-        try:
+        with self._temporary_lr_schedule():
+            self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr = max_lr, pct_start=pct_start,
+                                  anneal_strategy=anneal_strategy, epochs=n_epochs, steps_per_epoch=steps_per_epoch)
+            self._step_per_batch = True
             self.train(n_epochs, early_stopping, patience)
+
+    @contextlib.contextmanager
+    def _temporary_lr_schedule(self):
+        # restores the scheduler and the optimizer hyperparameters (lr, betas, ...) a temporary scheduler changes
+        saved_scheduler, saved_step_per_batch = self.lr_scheduler, self._step_per_batch
+        saved_hparams = [{k: v for k, v in g.items() if k != 'params'} for g in self.optimizer.param_groups]
+        try:
+            yield
         finally:
-            self._step_per_batch = False
+            self.lr_scheduler, self._step_per_batch = saved_scheduler, saved_step_per_batch
+            for group, hparams in zip(self.optimizer.param_groups, saved_hparams):
+                params = group['params']
+                group.clear()
+                group.update(hparams, params=params)
 
 
-    def train(self,n_epochs=5, early_stopping=False, patience = 10):
+    def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None):
+        # lr overrides the optimizer's learning rate for this and subsequent runs; ignored when a scheduler is set
+        if lr is not None:
+            if self.lr_scheduler is not None:
+                warnings.warn('lr passed to train() is ignored because an lr_scheduler is set.')
+            else:
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = lr
         best_metric = None
         patience_counter = 0
         for epoch in range(n_epochs):
