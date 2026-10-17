@@ -1,0 +1,295 @@
+TRAIN HARNESS (train_harness.py) - CHANGES AND USAGE NOTES
+==========================================================
+Date: 2026-10-16
+
+This file summarises the review of the Trainer class in train_harness.py:
+what was wrong or slow, what was changed and why, the new optional
+arguments, and the DataLoader settings to use alongside it.
+
+All changes were tested in a scratch Python environment (torch 2.14.1,
+torchmetrics, macOS 26.6 on Apple Silicon). Tests covered CPU and MPS.
+CUDA was not available, so CUDA behaviour is based on how PyTorch is
+documented to work, not on a test run.
+
+
+----------------------------------------------------------------------
+1. BUGS FIXED
+----------------------------------------------------------------------
+
+1.1  OneCycleLR was stepped once per epoch instead of once per batch
+     Problem: train_one_cycle() builds OneCycleLR with
+       total steps = epochs * steps_per_epoch
+     but the scheduler was only stepped at the end of each epoch. The
+     schedule only got about 1/steps_per_epoch of the way through, so
+     the learning rate stayed near max_lr/25 (4e-4 with the defaults)
+     and never reached max_lr. Training converged much more slowly than
+     it should have. This was the biggest cost in the file.
+     Fix: train_one_cycle() sets an internal flag (_step_per_batch).
+     While it is set, the scheduler steps after every optimizer step.
+     Other schedulers (StepLR etc.) still step once per epoch. The flag
+     is reset afterwards in a try/finally.
+     Verified: OneCycle now completes all of its steps (e.g. 21/21) and
+     the learning rate rises to max_lr and anneals back down.
+
+1.2  Number of classes was taken from the number of samples
+     Problem: for a dataset that wasn't a Subset, the code used
+     len(dataset), which is the number of samples (e.g. 50000 for
+     CIFAR-10), as num_classes. torchmetrics would either raise a shape
+     error or build huge per-class state.
+     Fix: num_classes comes from dataset.classes, unwrapping nested
+     Subsets. There is also a new num_classes= argument for datasets
+     without a .classes attribute. The task string is now lowercase
+     ('binary' / 'multiclass').
+
+1.3  A metric you passed in was not moved to the device
+     Problem: `metric.device = device` does not move a torchmetrics
+     metric. `device` is a read-only property, so the line would
+     probably raise an error.
+     Fix: self.metric = metric.to(device), for both custom and default
+     metrics.
+
+
+----------------------------------------------------------------------
+2. PERFORMANCE FIXES
+----------------------------------------------------------------------
+
+2.1  loss.item() on every batch
+     Problem: .item() forces the CPU to wait for the GPU on every step,
+     so the GPU can't queue work ahead.
+     Fix: the loss is summed on the device
+       (total_loss += loss.detach())
+     and read with .item() once per epoch.
+     Side effect: GPU work is asynchronous, so the epoch timer would be
+     slightly off. A _synchronize() helper (CUDA or MPS) runs before the
+     timer stops.
+
+2.2  Training metric received the non-detached output
+     Fix: metric.update(y_pred.detach(), y), so the metric doesn't
+     touch the autograd graph.
+
+2.3  Host-to-device copies were blocking
+     Fix: .to(device, non_blocking=True) in both training and
+     evaluation. Transfers now go through a _to_device() helper.
+     NOTE: this only helps if the DataLoader uses pin_memory=True on
+     CUDA (see section 5).
+
+
+----------------------------------------------------------------------
+3. MINOR FIXES
+----------------------------------------------------------------------
+
+- Initializer.use_he_init now covers nn.Conv2d as well as nn.Linear.
+  Before, conv layers kept PyTorch's default initialization. It also
+  skips layers with bias=False instead of crashing.
+- Removed the dead `def history(self)` method. The instance attribute
+  self.history (a dict) replaced it as soon as __init__ ran.
+  self.history is still available as before.
+- The "best epoch" comparison now uses the metric's higher_is_better
+  attribute (torchmetrics provides it), so lower-is-better metrics
+  work. If the attribute is missing, higher is assumed better. The
+  first epoch always counts as best (previously best_metric started at
+  a hard-coded 0.0).
+- The final checkpoint reload uses
+    torch.load(path, map_location=self.device, weights_only=True)
+  so a checkpoint loads onto the right device without unpickling
+  arbitrary objects.
+
+Behaviour changes to know about:
+- self.device is now a torch.device, not a string.
+- If you build a Trainer on a dataset without a .classes attribute and
+  don't pass a metric, you now need to pass num_classes=.
+
+
+----------------------------------------------------------------------
+4. NEW FEATURES
+----------------------------------------------------------------------
+
+4.1  Mixed precision (AMP)
+     What it does: runs the forward pass and loss in 16-bit floats
+     (fp16 or bf16) where that is safe, keeping sensitive operations
+     (e.g. the loss) in fp32. 16-bit math uses less memory bandwidth
+     and faster hardware paths. Typical speedup is 1.5-3x for CNNs on
+     NVIDIA GPUs; on MPS it is usually smaller and less predictable.
+
+     How it is implemented (device-agnostic, no MPS-specific code):
+       - torch.autocast(device_type=self.device.type, ...) around the
+         forward pass and loss, in both training and evaluation.
+       - torch.amp.GradScaler(self.device.type) for fp16. With bf16 or
+         AMP off it is disabled and does nothing, so one code path
+         covers every device.
+       - The training step is:
+           scaler.scale(loss).backward(); scaler.step(optimizer);
+           scaler.update(); optimizer.zero_grad()
+
+     Default precision per device:
+       CUDA : bf16 if torch.cuda.is_bf16_supported() (Ampere or newer,
+              no GradScaler needed), otherwise fp16 + GradScaler
+       MPS  : fp16 + GradScaler. bf16 also worked on the tested
+              setup, but older macOS/torch versions don't support it.
+       CPU  : AMP off. bf16 autocast is often slower on CPUs without
+              AMX/AVX512-BF16.
+
+     Caveats:
+       - With fp16, the GradScaler occasionally skips an optimizer step
+         when it detects inf/NaN gradients, mostly early in training.
+         The per-batch OneCycleLR step then gives a harmless
+         "lr_scheduler.step() before optimizer.step()" warning.
+       - If you add gradient clipping later, call
+         scaler.unscale_(optimizer) before clip_grad_norm_.
+       - Metrics receive fp16/bf16 logits. That's fine for accuracy
+         (argmax); for probability-sensitive metrics pass
+         y_pred.float().
+       - On MPS, time a few epochs with amp=False and amp=True before
+         relying on it.
+
+4.2  torch.compile
+     What it does: a just-in-time compiler for the model. Instead of
+     running each layer one operation at a time in Python, it captures
+     the computation as a graph and generates optimized code for it.
+     The first time the model runs:
+       1. Capture (TorchDynamo): watches the Python code of forward()
+          and records tensor operations into a graph. Code it can't
+          handle (data-dependent ifs, print, numpy) causes a "graph
+          break": that part runs in normal Python and the rest is split
+          into separate graphs. It also records "guards" (input shape,
+          dtype, device, model.training); if one fails later, it
+          recompiles.
+       2. Backward pass (AOTAutograd): works out the gradient
+          computation ahead of time, so the backward pass is optimized
+          too.
+       3. Code generation (Inductor): Triton kernels on NVIDIA GPUs,
+          C++ on CPU, Metal shaders on MPS. The result is cached and
+          reused.
+
+     Where the speedup comes from:
+       - Fusion: e.g. BatchNorm -> ReLU -> add becomes one kernel that
+         reads and writes memory once instead of three times. CNNs are
+         often memory-bound, so this is the main gain. Convolutions
+         themselves mostly still use cuDNN.
+       - Less Python and kernel-launch overhead. mode='reduce-overhead'
+         goes further and uses CUDA Graphs to replay a whole step with
+         almost no CPU work (best for small models / small batches).
+       - Autotuning: mode='max-autotune' benchmarks kernel variants
+         and keeps the fastest. It compiles much more slowly.
+       Typical result: about 1.2-2x faster for a CNN on a recent
+       NVIDIA GPU, most when combined with AMP and channels_last.
+
+     Benchmark on this Mac (small CNN, batch 64, time per training
+     step):
+       Device | Eager  | Compiled | First 5 steps compiled (incl. compiling)
+       CPU    | 123 ms | 135 ms   | 10.8 s
+       MPS    |  37 ms |  65 ms   |  2.3 s
+     So compile made training SLOWER on both CPU and MPS here. Keep it
+     off on the Mac; use it on NVIDIA GPUs.
+
+     How it is implemented:
+       - self.model stays uncompiled and the compiled version is stored
+         as self._fwd. The forward pass uses self._fwd. This matters
+         because a compiled module's state_dict keys get an
+         '_orig_mod.' prefix; saving from it would give checkpoints
+         that can't load into an uncompiled model. Checkpoints are
+         saved from self.model, so keys stay plain (e.g. '0.weight').
+       - The compiled wrapper shares the same parameters, so the
+         optimizer and load_state_dict keep working on self.model.
+       - model.train() and model.eval() produce different graphs
+         (BatchNorm/dropout behave differently). Each compiles once and
+         is then cached.
+       - The first epoch after compiling is labelled
+         "(incl. compile)" in the printed output so its slow time isn't
+         mistaken for a problem.
+       - A warning is raised if compile is on and the training
+         DataLoader doesn't set drop_last=True (see section 5).
+       - AMP's autocast and GradScaler work under compile, and the
+         harness reads loss/y_pred straight away, which is safe even
+         with CUDA Graphs.
+
+4.3  channels_last memory layout
+     What it does: stores image tensors as NHWC instead of NCHW. On
+     NVIDIA GPUs this is the layout tensor-core convolution kernels
+     prefer, especially with AMP and compile.
+     How it is implemented: when on, the model is converted with
+     model.to(memory_format=torch.channels_last) before the optimizer
+     is created, and 4-D input batches are converted in _to_device().
+     Checkpoints saved in channels_last load fine into a normal model.
+
+
+----------------------------------------------------------------------
+5. DATALOADER SETTINGS (set these where you build your loaders)
+----------------------------------------------------------------------
+
+These aren't in train_harness.py; set them where you create the
+DataLoaders. For small CNNs, data loading is often the real bottleneck.
+
+  pin_memory        = (device == 'cuda')
+      Needed for non_blocking=True to speed up transfers on CUDA. Not
+      supported on MPS: PyTorch warns and falls back to normal memory,
+      so set it only for CUDA.
+  num_workers       > 0   (e.g. 4-8, depending on CPU cores)
+      Loads and augments batches in parallel worker processes.
+  persistent_workers = True   (requires num_workers > 0)
+      Keeps workers alive between epochs instead of restarting them.
+  drop_last         = True   on the TRAINING loader when compile is on
+      The smaller last batch otherwise triggers a recompile and can
+      switch the graph to slower dynamic-shape code. The validation
+      loader's last batch causes one extra compile, which is fine.
+
+Example:
+  train_dl = DataLoader(train_ds, batch_size=128, shuffle=True,
+                        num_workers=4, persistent_workers=True,
+                        pin_memory=(device == 'cuda'),
+                        drop_last=True)
+  valid_dl = DataLoader(valid_ds, batch_size=256,
+                        num_workers=4, persistent_workers=True,
+                        pin_memory=(device == 'cuda'))
+
+
+----------------------------------------------------------------------
+6. Trainer ARGUMENTS - NEW ONES AND RECOMMENDED VALUES
+----------------------------------------------------------------------
+
+  num_classes=None
+      Leave as None if your dataset (or the dataset inside a Subset)
+      has a .classes attribute. Otherwise pass the number of classes.
+      Ignored if you pass your own metric.
+
+  amp=True
+      Mixed precision on CUDA and MPS (always off on CPU). Set False
+      to compare speed or debug numerical issues.
+
+  amp_dtype=None
+      None picks automatically (see 4.1). Override with torch.float16
+      or torch.bfloat16 if needed.
+
+  compile=False
+      False : no compilation (recommended on Mac CPU/MPS).
+      True  : default compile mode (recommended on NVIDIA GPUs).
+      'reduce-overhead' : CUDA Graphs; good for small models/batches.
+      'max-autotune'    : slowest to compile, sometimes fastest.
+
+  channels_last=False
+      Set True on NVIDIA GPUs together with AMP and compile.
+
+Recommended configurations:
+
+  Mac (MPS):
+    Trainer(model, train_dl, valid_dl, device='mps')
+      # amp=True default (fp16); compile and channels_last off.
+      # Time a few epochs with amp=False vs True.
+
+  NVIDIA GPU:
+    Trainer(model, train_dl, valid_dl, device='cuda',
+            compile=True, channels_last=True)
+      # amp=True default (bf16 on Ampere+); drop_last=True on train_dl.
+
+  CPU:
+    Trainer(model, train_dl, valid_dl, device='cpu')
+      # AMP is off automatically; compile not recommended.
+
+Training:
+  trainer.train_one_cycle(n_epochs=..., max_lr=...)   # OneCycle, stepped per batch
+  trainer.train(n_epochs=...)                         # any per-epoch scheduler
+  trainer.evaluate(dataloader)
+  trainer.history  # dict: train_loss, train_metric, valid_metric, learning_rate
+
+Initialization (now covers conv layers):
+  model.apply(Initializer.use_he_init)
