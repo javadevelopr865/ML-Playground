@@ -1,0 +1,82 @@
+Proposed change to train_harness.py: keep the optimizer in sync with the model
+==============================================================================
+
+Status: NOT APPLIED. Written 2026-10-17 as a plan to apply later on request.
+The code below was prototyped and tested against train_harness.py as of that date.
+
+Problem
+-------
+Trainer.self.model is the same object the caller holds, so in-place changes are shared.
+But the optimizer was built from the model's parameters at __init__ time. If layers or
+parameters are swapped afterwards (e.g. model.fc = nn.Linear(...)), the optimizer keeps
+updating the old, now-detached parameters and the new layer never trains.
+
+Approach
+--------
+Patch the existing optimizer in place rather than building a new one:
+  - the lr_scheduler and GradScaler hold references to self.optimizer, so a new optimizer
+    would orphan the scheduler;
+  - optimizer.state is keyed by Parameter objects, so state (Adam moments, step counts) for
+    untouched parameters is kept automatically.
+
+Rules:
+  - parameters no longer in the model are removed from their group, and their state dropped;
+  - new parameters are appended to param group 0 (NOT add_param_group(): schedulers record
+    one base lr per group at construction, so a new group breaks an existing scheduler);
+  - a parameter whose tensor was replaced with a different shape (p.data = ...) keeps its
+    identity, so its stale state is reset to avoid a shape error on the next step;
+  - a warning is emitted only when something changed, so the event isn't silent.
+
+Changes
+-------
+1. Add this method to Trainer (e.g. after _temporary_lr_schedule):
+
+    def sync_optimizer(self):
+        params = list(self.model.parameters())
+        live = {id(p) for p in params}
+        removed = 0
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                if id(p) not in live:
+                    self.optimizer.state.pop(p, None)
+                    removed += 1
+            group['params'] = [p for p in group['params'] if id(p) in live]
+        known = {id(p) for g in self.optimizer.param_groups for p in g['params']}
+        added = [p for p in params if id(p) not in known]
+        self.optimizer.param_groups[0]['params'].extend(added)
+        reshaped = 0
+        for p in params:
+            state = self.optimizer.state.get(p, {})
+            if any(torch.is_tensor(v) and v.dim() > 0 and v.shape != p.shape for v in state.values()):
+                del self.optimizer.state[p]
+                reshaped += 1
+        if removed or added or reshaped:
+            warnings.warn(f'optimizer synced with model: {len(added)} params added, {removed} removed, '
+                          f'{reshaped} reset after a shape change')
+
+2. Call it as the first line of train():
+
+    def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None):
+        self.sync_optimizer()
+        ...
+
+No other changes are needed: the compiled _fwd wraps the same module (structural changes
+just trigger a recompile), and train_one_cycle() goes through train().
+
+Known limitations / decisions to revisit
+----------------------------------------
+- With multiple param groups (e.g. backbone vs head lrs), new params always land in group 0.
+  If that matters, add a parameter such as sync_optimizer(group=0).
+- If the caller built an optimizer over only trainable params (filtered on requires_grad),
+  sync will add the frozen ones to group 0. Harmless (they have no grad, so steps skip them),
+  but they will appear in the optimizer.
+- A group whose params are all removed is left as an empty group (torch tolerates this), so
+  scheduler group counts stay consistent.
+
+Tested (scratchpad prototype)
+-----------------------------
+- Swapping the last Linear layer: warning reports 2 added / 2 removed; Adam state of
+  untouched layers is unchanged; the new layer joins group 0 and gets state after training;
+  an existing StepLR scheduler keeps working.
+- Calling it again with no changes: no warning.
+- Replacing a tensor via .data with a different shape: its state is reset; same shape: kept.
