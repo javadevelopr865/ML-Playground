@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Sat Oct 17 21:21:21 2026
+# Last Modified: Sun Oct 18 22:05:05 2026
 #
 # Author: samuelo
 #
@@ -47,7 +47,7 @@ class Trainer:
         self.channels_last = channels_last
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
-        self.model = model
+        self.model = model.to(device)
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
         self.criterion = criterion or nn.CrossEntropyLoss()
@@ -102,11 +102,11 @@ class Trainer:
         elif self.device.type == 'mps':
             torch.mps.synchronize()
 
-    def _to_device(self, X, is_X=False):
+    def _to_device(self, X, y):
         X = X.to(self.device, non_blocking=True)
-        if is_X and self.channels_last and X.dim() == 4:
+        if self.channels_last and X.dim() == 4:
             X = X.contiguous(memory_format=torch.channels_last)
-        return X
+        return X, y.to(self.device, non_blocking=True)
 
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
@@ -117,17 +117,10 @@ class Trainer:
         self.model.eval()
         self.metric.reset()
         with torch.inference_mode():
-            for inputs, y in dataLoader:
-                try:
-                    X= list(inputs.values())
-                except AttributeError:
-                    try:
-                        X= list(inputs)
-                    except TypeError:
-                        X = [inputs]
-                X,y=[self._to_device(x,is_X=true) for x in X ], self.to_device(y)
+            for X,y in dataLoader:
+                X, y = self._to_device(X, y)
                 with self._autocast():
-                    y_pred = self._fwd(*X)
+                    y_pred = self._fwd(X)
                 self.metric.update(y_pred, y)
         return self.metric.compute()
 
@@ -182,19 +175,10 @@ class Trainer:
             # accumulate on device to avoid a CPU<->GPU sync every batch
             total_loss = torch.zeros((), device=self.device)
             t0 = time.time()
-            for inputs, y in self.train_dataloader:
-                try:
-                    X= list(inputs.values())
-                except AttributeError:
-                    try:
-                        X= list(inputs)
-                    except TypeError:
-                        X = [inputs]
-
-                X,y=[self._to_device(x,is_X=true) for x in X ], self.to_device(y)
-
+            for X,y in self.train_dataloader:
+                X, y = self._to_device(X, y)
                 with self._autocast():
-                    y_pred = self._fwd(*X)
+                    y_pred = self._fwd(X)
                     loss = self.criterion(y_pred, y)
                 total_loss += loss.detach()
                 # scaler is a no-op unless training in fp16
