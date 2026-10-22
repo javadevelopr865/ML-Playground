@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Sun Oct 18 22:05:05 2026
+# Last Modified: Thu Oct 22 00:14:05 2026
 #
 # Author: samuelo
 #
@@ -37,7 +37,7 @@ class Trainer:
             default_lr = 1e-3,
             weight_decay=1e-3,
             checkpoint_path=None,
-            device='cpu',
+            device=None,
             num_classes=None,
             amp=True,
             amp_dtype=None,
@@ -47,6 +47,15 @@ class Trainer:
         self.channels_last = channels_last
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
+
+        if device is None:
+            device = next(model.parameters()).device
+            if device.type == 'cpu': #not explicitly set perhaps
+                device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
+    
+        #torch.set_default_device(device)
+        self.device = torch.device(device)
+
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
@@ -69,7 +78,8 @@ class Trainer:
         # OneCycleLR and similar schedulers must be stepped every batch, not every epoch
         self._step_per_batch = False
         self.checkpoint_path = checkpoint_path or f'{secrets.token_hex(8)}.pt'
-        self.device = torch.device(device)
+
+
 
         # mixed precision: bf16 on CUDA when supported, else fp16 (needs a GradScaler); off on CPU
         if amp_dtype is None:
@@ -111,17 +121,18 @@ class Trainer:
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
 
+    @torch.inference_mode()
     def _evaluate(self, dataLoader=None):
         if dataLoader is None:
             dataLoader = self.valid_dataloader
         self.model.eval()
         self.metric.reset()
-        with torch.inference_mode():
-            for X,y in dataLoader:
-                X, y = self._to_device(X, y)
-                with self._autocast():
-                    y_pred = self._fwd(X)
-                self.metric.update(y_pred, y)
+            
+        for X,y in dataLoader:
+            X, y = self._to_device(X, y)
+            with self._autocast():
+                y_pred = self._fwd(X)
+            self.metric.update(y_pred, y)
         return self.metric.compute()
 
     def evaluate(self, dataloader):
