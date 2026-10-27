@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Thu Oct 22 00:14:05 2026
+# Last Modified: Thu Oct 22 15:03:56 2026
 #
 # Author: samuelo
 #
@@ -64,10 +64,17 @@ class Trainer:
 
         if metric is None:
             if num_classes is None:
-                _ds = train_dataloader.dataset
-                while isinstance(_ds, torch.utils.data.Subset):
-                    _ds = _ds.dataset
-                num_classes = len(_ds.classes)
+                #try to infer from dataset if possible
+                try:
+                    _ds = train_dataloader.dataset
+                    while isinstance(_ds, torch.utils.data.Subset):
+                        _ds = _ds.dataset
+                    num_classes = len(_ds.classes)
+                except AttributeError:
+                    sample_x, _ = self._sample(train_dataloader)
+                    _l = self.model(sample_x).shape
+                    num_classes = _l[1] if len(_l) > 2 else _l[-1]   ##### This is probably not correct!
+
             task = 'binary' if num_classes <= 2 else 'multiclass'
             metric = torchmetrics.Accuracy(task=task, num_classes=num_classes)
         self.metric = metric.to(device)
@@ -106,6 +113,7 @@ class Trainer:
 
         self.history ={"train_loss":[], "train_metric":[], "valid_metric":[], "learning_rate":[]}
 
+
     def _synchronize(self):
         if self.device.type == 'cuda':
             torch.cuda.synchronize(self.device)
@@ -117,6 +125,10 @@ class Trainer:
         if self.channels_last and X.dim() == 4:
             X = X.contiguous(memory_format=torch.channels_last)
         return X, y.to(self.device, non_blocking=True)
+    
+    def _sample(self, dataLoader):
+        sample= next(iter(dataLoader))
+        return self._to_device(*sample)
 
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
