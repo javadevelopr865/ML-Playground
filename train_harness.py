@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Tue Oct 27 17:52:46 2026
+# Last Modified: Tue Oct 27 18:47:59 2026
 #
 # Author: samuelo
 #
@@ -201,7 +201,34 @@ class Trainer:
                 group.update(hparams, params=params)
 
 
+    def sync_optimizer(self):
+        params = list(self.model.parameters())
+        live = {id(p) for p in params}
+        removed, reshaped = 0,0
+
+        for group in self.optimizer.param_groups:
+            for p in group['params']:
+                if id(p) not in live:
+                    self.optimizer.state.pop(p,None)
+                    removed += 1
+            group['params'] = [p for p in group['params'] if id(p) in live]
+        known = {id(p) for g in self.optimizer.param_groups for p in g['params']}
+        added = [p for p in params if id(p) not in known]
+        self.optimizer.param_groups[0]['params'].extend(added)
+
+        for p in params:
+            state = self.optimizer.state.get(p,{})
+            if any(torch.is_tensor(v) and v.dim() > 0 and v.shape != p.shape for v in state.values()):
+                del self.optimizer.state[p]
+                reshaped += 1
+        
+        if removed or added or reshaped:
+            warnings.warn(f'optimizer synced with model: {len(added)} params added, {removed} removed, '
+                          f'{reshaped} reset after a shape change')
+
+
     def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None):
+        self.sync_optimizer()
         # lr overrides the optimizer's learning rate for this and subsequent runs; ignored when a scheduler is set
         if lr is not None:
             if self.lr_scheduler is not None:
