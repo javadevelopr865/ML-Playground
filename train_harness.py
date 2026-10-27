@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Tue Oct 27 17:11:58 2026
+# Last Modified: Tue Oct 27 17:52:46 2026
 #
 # Author: samuelo
 #
@@ -147,7 +147,8 @@ class Trainer:
         return self.metric.compute()
 
     def _get_task(self, num_classes=None):
-        return self._task if self._task is not None
+        if self._task is not None:
+            return self._task 
         
         if num_classes is None:
             #try to infer from dataset if possible
@@ -157,7 +158,7 @@ class Trainer:
                     _ds = _ds.dataset
                 num_classes = len(_ds.classes)
             except AttributeError:
-                sample_x, _ = self._sample(train_dataloader)
+                sample_x, _ = self._sample(self.train_dataloader)
                 _l = self.model(sample_x).shape
                 num_classes = _l[1] if len(_l) > 2 else _l[-1]   ##### This is probably not correct!
         
