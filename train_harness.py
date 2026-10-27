@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Thu Oct 22 15:03:56 2026
+# Last Modified: Tue Oct 27 17:11:58 2026
 #
 # Author: samuelo
 #
@@ -59,27 +59,26 @@ class Trainer:
         self.model = model.to(device)
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
-        self.criterion = criterion or nn.CrossEntropyLoss()
         self.optimizer = optimizer or torch.optim.AdamW(self.model.parameters(), lr=default_lr, weight_decay=weight_decay)
 
+        self._task = None
+    
         if metric is None:
-            if num_classes is None:
-                #try to infer from dataset if possible
-                try:
-                    _ds = train_dataloader.dataset
-                    while isinstance(_ds, torch.utils.data.Subset):
-                        _ds = _ds.dataset
-                    num_classes = len(_ds.classes)
-                except AttributeError:
-                    sample_x, _ = self._sample(train_dataloader)
-                    _l = self.model(sample_x).shape
-                    num_classes = _l[1] if len(_l) > 2 else _l[-1]   ##### This is probably not correct!
-
-            task = 'binary' if num_classes <= 2 else 'multiclass'
-            metric = torchmetrics.Accuracy(task=task, num_classes=num_classes)
+            self._task = self._get_task(num_classes)
+            metric = torchmetrics.Accuracy(task=self._task, num_classes=num_classes)
         self.metric = metric.to(device)
+        
+        if criterion is None:
+            criterion = nn.BCEWithLogitsLoss() if self._get_task(num_classes) =='binary' else nn.CrossEntropyLoss()
+        
+
         # torchmetrics metrics declare higher_is_better; assume True otherwise
         self.higher_is_better = getattr(self.metric, 'higher_is_better', None) is not False
+
+        
+        self.criterion = criterion or nn.CrossEntropyLoss()
+        
+
 
         self.lr_scheduler = lr_scheduler
         # OneCycleLR and similar schedulers must be stepped every batch, not every epoch
@@ -146,6 +145,25 @@ class Trainer:
                 y_pred = self._fwd(X)
             self.metric.update(y_pred, y)
         return self.metric.compute()
+
+    def _get_task(self, num_classes=None):
+        return self._task if self._task is not None
+        
+        if num_classes is None:
+            #try to infer from dataset if possible
+            try:
+                _ds = self.train_dataloader.dataset
+                while isinstance(_ds, torch.utils.data.Subset):
+                    _ds = _ds.dataset
+                num_classes = len(_ds.classes)
+            except AttributeError:
+                sample_x, _ = self._sample(train_dataloader)
+                _l = self.model(sample_x).shape
+                num_classes = _l[1] if len(_l) > 2 else _l[-1]   ##### This is probably not correct!
+        
+        self._task = 'binary' if num_classes <= 2 else 'multiclass'
+        return self._task
+        
 
     def evaluate(self, dataloader):
         return self._evaluate(dataLoader=dataloader)
