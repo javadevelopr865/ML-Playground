@@ -3,7 +3,7 @@
 #
 # Date Created: Oct 07,2026
 #
-# Last Modified: Tue Oct 27 18:47:59 2026
+# Last Modified: Wed Oct 28 11:49:13 2026
 #
 # Author: samuelo
 #
@@ -13,7 +13,8 @@
 import torch
 import torch.nn as nn
 import torchmetrics
-import time, secrets, warnings, contextlib
+import time, secrets, warnings, contextlib, reprlib
+from collections.abc import Mapping
 
 class Initializer:
     @staticmethod
@@ -36,15 +37,22 @@ class Trainer:
             lr_scheduler=None,
             default_lr = 1e-3,
             weight_decay=1e-3,
-            checkpoint_path=None,
+            checkpoint_path='auto',
             device=None,
             num_classes=None,
             amp=True,
             amp_dtype=None,
             compile=False,
             channels_last=False,
+            prepare_batch=None,
             ):
         self.channels_last = channels_last
+        self.train_dataloader = train_dataloader
+        self.valid_dataloader = valid_dataloader
+        # prepare_batch(batch) -> (X, y) runs on every batch before it is moved to the device: use it to
+        # convert dtypes or to split batches that aren't (X, y) pairs, e.g. a dict with a 'label' key
+        self.prepare_batch = prepare_batch
+        
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
 
@@ -57,33 +65,33 @@ class Trainer:
         self.device = torch.device(device)
 
         self.model = model.to(device)
-        self.train_dataloader = train_dataloader
-        self.valid_dataloader = valid_dataloader
         self.optimizer = optimizer or torch.optim.AdamW(self.model.parameters(), lr=default_lr, weight_decay=weight_decay)
 
         self._task = None
     
         if metric is None:
-            self._task = self._get_task(num_classes)
+            self._task, num_classes = self._get_task(num_classes)
             metric = torchmetrics.Accuracy(task=self._task, num_classes=num_classes)
         self.metric = metric.to(device)
-        
+        # torchmetrics classification metrics reject float targets, but BCEWithLogitsLoss needs them
+        self._int_metric_targets = type(self.metric).__module__.startswith('torchmetrics.classification')
+
         if criterion is None:
-            criterion = nn.BCEWithLogitsLoss() if self._get_task(num_classes) =='binary' else nn.CrossEntropyLoss()
-        
+            criterion = nn.BCEWithLogitsLoss() if self._get_task(num_classes)[0] =='binary' else nn.CrossEntropyLoss()
+        self.criterion = criterion 
 
         # torchmetrics metrics declare higher_is_better; assume True otherwise
         self.higher_is_better = getattr(self.metric, 'higher_is_better', None) is not False
 
         
-        self.criterion = criterion or nn.CrossEntropyLoss()
         
 
 
         self.lr_scheduler = lr_scheduler
         # OneCycleLR and similar schedulers must be stepped every batch, not every epoch
         self._step_per_batch = False
-        self.checkpoint_path = checkpoint_path or f'{secrets.token_hex(8)}.pt'
+        # 'auto' saves the best model to a random file name; None disables checkpointing
+        self.checkpoint_path = f'{secrets.token_hex(8)}.pt' if checkpoint_path == 'auto' else checkpoint_path
 
 
 
@@ -119,15 +127,69 @@ class Trainer:
         elif self.device.type == 'mps':
             torch.mps.synchronize()
 
-    def _to_device(self, X, y):
-        X = X.to(self.device, non_blocking=True)
-        if self.channels_last and X.dim() == 4:
-            X = X.contiguous(memory_format=torch.channels_last)
-        return X, y.to(self.device, non_blocking=True)
-    
+    def _move(self, obj, channels_last=False):
+        # moves every tensor in a nested batch (dicts, lists, tuples, namedtuples) to the device;
+        # leaves without a .to() (strings, ids kept for debugging) pass through unchanged
+        if torch.is_tensor(obj):
+            obj = obj.to(self.device, non_blocking=True)
+            if channels_last and obj.dim() == 4:
+                obj = obj.contiguous(memory_format=torch.channels_last)
+            return obj
+        if callable(getattr(obj, 'to', None)):   # e.g. a transformers BatchEncoding
+            return obj.to(self.device)
+        if isinstance(obj, Mapping):
+            moved = {k: self._move(v, channels_last) for k, v in obj.items()}
+            try:
+                return type(obj)(moved)
+            except TypeError:
+                return moved
+        if isinstance(obj, tuple) and hasattr(obj, '_fields'):   # namedtuple
+            return type(obj)(*(self._move(v, channels_last) for v in obj))
+        if isinstance(obj, (list, tuple)):
+            return type(obj)(self._move(v, channels_last) for v in obj)
+        return obj
+
+    @staticmethod
+    def _has_tensor(obj):
+        if torch.is_tensor(obj) or callable(getattr(obj, 'to', None)):
+            return True
+        if isinstance(obj, Mapping):
+            return any(Trainer._has_tensor(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(Trainer._has_tensor(v) for v in obj)
+        return False
+
+    def _to_device(self, batch):
+        if self.prepare_batch is not None:
+            batch = self.prepare_batch(batch)
+        if not (isinstance(batch, (list, tuple)) and len(batch) == 2):
+            raise TypeError(
+                f'expected each batch to be an (inputs, targets) pair, got {self._describe(batch)}. '
+                'Return (X, y) from your dataset/collate_fn, or pass prepare_batch=... to Trainer '
+                "to split it, e.g. prepare_batch=lambda b: ({k: v for k, v in b.items() if k != 'label'}, b['label'])")
+        X, y = batch
+        hints = {'inputs': '',
+                 'targets': ' (e.g. torch.tensor(labels, dtype=torch.float32) for BCEWithLogitsLoss, '
+                            'dtype=torch.long for CrossEntropyLoss)'}
+        for name, part in (('inputs', X), ('targets', y)):
+            if not self._has_tensor(part):
+                raise TypeError(
+                    f'batch {name} contain no tensors: got {self._describe(part)}. '
+                    f'Return tensors from your dataset/collate_fn{hints[name]}, '
+                    'or pass prepare_batch=... to Trainer to convert them.')
+        return self._move(X, self.channels_last), self._move(y)
+
+    @staticmethod
+    def _describe(obj):
+        return f'{type(obj).__name__} {reprlib.repr(obj)}'
+
     def _sample(self, dataLoader):
-        sample= next(iter(dataLoader))
-        return self._to_device(*sample)
+        return self._to_device(next(iter(dataLoader)))
+
+    def _metric_target(self, y):
+        if self._int_metric_targets and torch.is_tensor(y) and y.is_floating_point():
+            return y.long()
+        return y
 
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
@@ -139,31 +201,46 @@ class Trainer:
         self.model.eval()
         self.metric.reset()
             
-        for X,y in dataLoader:
-            X, y = self._to_device(X, y)
+        for batch in dataLoader:
+            X, y = self._to_device(batch)
             with self._autocast():
                 y_pred = self._fwd(X)
-            self.metric.update(y_pred, y)
+            self.metric.update(y_pred, self._metric_target(y))
         return self.metric.compute()
 
     def _get_task(self, num_classes=None):
         if self._task is not None:
-            return self._task 
+            return self._task, num_classes 
         
+        # the task follows from the model's output, not the class count: one logit per sample is binary
+        # (BCEWithLogitsLoss), C logits along dim 1 is multiclass (CrossEntropyLoss), even when C == 2
+        sample_x, _ = self._sample(self.train_dataloader)
+        was_training = self.model.training
+        self.model.eval()   # don't let the probe update batchnorm statistics
+        with torch.no_grad():
+            out_shape = self.model(sample_x).shape
+        self.model.train(was_training)
+        n_logits = 1 if len(out_shape) == 1 else out_shape[1]
+
+        if n_logits == 1:
+            self._task = 'binary'
+            return self._task, num_classes
+
         if num_classes is None:
-            #try to infer from dataset if possible
             try:
                 _ds = self.train_dataloader.dataset
                 while isinstance(_ds, torch.utils.data.Subset):
                     _ds = _ds.dataset
                 num_classes = len(_ds.classes)
             except AttributeError:
-                sample_x, _ = self._sample(self.train_dataloader)
-                _l = self.model(sample_x).shape
-                num_classes = _l[1] if len(_l) > 2 else _l[-1]   ##### This is probably not correct!
-        
-        self._task = 'binary' if num_classes <= 2 else 'multiclass'
-        return self._task
+                num_classes = n_logits
+        if num_classes != n_logits:
+            warnings.warn(f'model outputs {n_logits} logits but there are {num_classes} classes; '
+                          f'using {n_logits}.')
+            num_classes = n_logits
+
+        self._task = 'multiclass'
+        return self._task, num_classes
         
 
     def evaluate(self, dataloader):
@@ -244,8 +321,8 @@ class Trainer:
             # accumulate on device to avoid a CPU<->GPU sync every batch
             total_loss = torch.zeros((), device=self.device)
             t0 = time.time()
-            for X,y in self.train_dataloader:
-                X, y = self._to_device(X, y)
+            for batch in self.train_dataloader:
+                X, y = self._to_device(batch)
                 with self._autocast():
                     y_pred = self._fwd(X)
                     loss = self.criterion(y_pred, y)
@@ -259,7 +336,7 @@ class Trainer:
                 if self._step_per_batch:
                     self.lr_scheduler.step()
 
-                self.metric.update(y_pred.detach(), y)
+                self.metric.update(y_pred.detach(), self._metric_target(y))
 
             self._synchronize()
             t1 = time.time()
