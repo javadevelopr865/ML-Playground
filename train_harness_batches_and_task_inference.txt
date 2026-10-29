@@ -2,7 +2,8 @@ Changes to train_harness.py: task inference, checkpointing, and batch handling
 ==============================================================================
 
 Status: APPLIED 2026-10-28. Sections 0-6 are in commit c11bab5; section 7 (multiple inputs and
-outputs) and the docstrings are in the commit that follows it.
+outputs) and the docstrings are in the commit that follows it; section 8 (device placement) in
+the one after that.
 Started from a failing learner.train() in ageron/Ch14.ipynb (cell 137: IMDB sentiment
 analysis with frozen BERT embeddings + bidirectional GRU). All changes below were tested
 against small synthetic models/dataloaders in ~/.venv (torch 2.14.0, torchmetrics 1.9.0).
@@ -203,11 +204,49 @@ Internal restructuring
 Public methods (Trainer.__init__, train, train_one_cycle, evaluate, sync_optimizer,
 Initializer.use_he_init) now have docstrings describing their parameters.
 
-Tested on cpu and mps (with AMP): two-input models, tuple/dict/namedtuple outputs, per-output
+Tested on cpu and mps (with AMP) -- see section 8 for device placement: two-input models, tuple/dict/namedtuple outputs, per-output
 and shared criteria/metrics/targets, loss-weight overrides (checked that the total loss equals
 the weighted sum of the per-output losses), monitor on a head metric, an Inception-style aux
 model with evaluate() before train(), and every error path above. The earlier single-output
 tests still pass.
+
+
+
+8. Device placement: device='auto' / 'model', models spread over devices
+-------------------------------------------------------------------------
+Problem: with device not given, a model on the cpu was silently moved to mps/cuda. Moving a
+model to the cpu on purpose (e.g. to work around the Ch14 "scaled_dot_product_attention for
+MPS does not support dropout" error) therefore had no effect, and nothing said why.
+
+Intent can't be detected: a freshly built model and one moved with .to('cpu') are identical
+(.to('cpu') on a cpu model is a no-op and PyTorch records no history of .to() calls). The one
+real signal is a model spread over several devices -- nobody does that by accident.
+
+So instead of guessing, the move is made visible and can be switched off:
+  device='auto'   (default; None means the same) a model on an accelerator stays where it is;
+                  a cpu model is moved to cuda/mps when available, with a warning:
+                    Trainer moved the model from cpu to mps; pass device='cpu' to train on the
+                    cpu, or device='model' to always keep the model where it is.
+  device='model'  always keep the model where it is.
+  'cpu', 'mps', torch.device(...)   used exactly as given (no warning).
+
+Why 'auto' stays the default rather than 'model': keeping the model in place is more
+predictable, but fails silently the other way -- forget .to(device) once and a BERT model
+trains on the cpu at a fraction of the speed. The warning gives most of the predictability
+without breaking notebooks that rely on the automatic move.
+
+Models spread over several devices (parameters and buffers on more than one device):
+  - 'auto' and 'model' never move them; inputs go to the device of the first parameter.
+  - an explicit single device raises a ValueError instead of collapsing the model onto it.
+  - targets are moved to the device of the output they belong to before the loss, and outputs
+    and targets are moved to the trainer's device for the metrics (_align()).
+  - mixed precision is turned off, with a warning, when the devices are of different types
+    (e.g. mps + cpu): torch.autocast covers one device type, so the cpu half got fp16 inputs
+    from the mps half and failed with "mat1 and mat2 must have the same dtype".
+
+Tested on mps: every placement combination above (cpu/mps models x default/None/'cpu'/
+torch.device/'model'/'mps'), a model split over mps and cpu trained end to end, and all the
+earlier test suites on cpu and mps.
 
 
 Known, deliberately left as is

@@ -42,7 +42,7 @@ class Trainer:
             default_lr = 1e-3,
             weight_decay=1e-3,
             checkpoint_path='auto',
-            device=None,
+            device='auto',
             num_classes=None,
             amp=True,
             amp_dtype=None,
@@ -70,7 +70,10 @@ class Trainer:
         default_lr, weight_decay: used only for the default optimizer.
         checkpoint_path: where the best model is saved and reloaded after training;
             'auto' picks a random file name, None disables checkpointing.
-        device: default is the model's device, or cuda/mps if available when the model is on the cpu.
+        device: 'auto' (default; None means the same) keeps a model that is on an accelerator where it is,
+            and moves a cpu model to cuda/mps when available, with a warning; 'model' always keeps the
+            model where it is; anything else ('cpu', 'mps', torch.device(...)) is used as given.
+            A model spread over several devices is never moved by 'auto'/'model'.
         num_classes: used for the default metric; inferred from the model output if not given.
         amp: mixed precision on cuda/mps. amp_dtype: default bf16 where supported, else fp16.
         compile: True or a torch.compile mode string ('reduce-overhead', 'max-autotune').
@@ -91,15 +94,29 @@ class Trainer:
         if channels_last:
             model = model.to(memory_format=torch.channels_last)
 
-        if device is None:
-            device = next(model.parameters()).device
-            if device.type == 'cpu': #not explicitly set perhaps
-                device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
+        # a model built on the cpu and one deliberately moved there look the same, so 'auto' moves a cpu
+        # model to an accelerator but says so; a model spread over several devices was placed on purpose
+        model_devices = {t.device for t in (*model.parameters(), *model.buffers())}
+        spread = len(model_devices) > 1
+        if device is None or device in ('auto', 'model'):
+            placement = device or 'auto'
+            if spread:
+                device = next(model.parameters()).device   # inputs go to the first layer's device
+            else:
+                device = model_devices.pop() if model_devices else torch.device('cpu')
+                best = self._best_accelerator()
+                if placement == 'auto' and device.type == 'cpu' and best != 'cpu':
+                    warnings.warn(f"Trainer moved the model from cpu to {best}; pass device='cpu' to train "
+                                  "on the cpu, or device='model' to always keep the model where it is.")
+                    device = best
+        elif spread:
+            raise ValueError(f'the model is spread over {sorted(map(str, model_devices))}; moving it all to {device} '
+                             "would undo that. Pass device='model' to keep it as placed, or move it yourself first.")
 
         #torch.set_default_device(device)
         self.device = torch.device(device)
 
-        self.model = model.to(device)
+        self.model = model if spread else model.to(self.device)
         self.optimizer = optimizer or torch.optim.AdamW(self.model.parameters(), lr=default_lr, weight_decay=weight_decay)
 
         if metric is None or criterion is None:
@@ -136,6 +153,10 @@ class Trainer:
             else:
                 amp_dtype = torch.float16
         self.amp_enabled = amp and self.device.type in ('cuda', 'mps')
+        # autocast covers a single device type, so a model spread over e.g. mps and cpu would mix dtypes
+        if self.amp_enabled and len({d.type for d in model_devices}) > 1:
+            warnings.warn('mixed precision is disabled: the model is spread over more than one device type.')
+            self.amp_enabled = False
         self.amp_dtype = amp_dtype
         self.scaler = torch.amp.GradScaler(self.device.type,
                                            enabled=self.amp_enabled and amp_dtype is torch.float16)
@@ -155,6 +176,10 @@ class Trainer:
         # train_/valid_ loss and metric per epoch; with multiple outputs also per output, e.g. 'valid_metric/aux'
         self.history = {}
 
+
+    @staticmethod
+    def _best_accelerator():
+        return 'cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu'
 
     def _synchronize(self):
         if self.device.type == 'cuda':
@@ -341,7 +366,7 @@ class Trainer:
         # returns the (weighted) total loss and, for multiple outputs, the unweighted loss of each output
         if self._out_keys is None:
             self._check_single(y_pred)
-            return self.criterion(y_pred, y), {}
+            return self.criterion(y_pred, self._align(y, y_pred)), {}
         preds, targets = self._split(y_pred, y)
         losses = {}
         for k, pred in preds.items():
@@ -351,10 +376,18 @@ class Trainer:
                 raise ValueError(f'no target for output {k!r}: return one, use None to skip that output, '
                                  'or set its loss weight to 0')
             if targets[k] is not None:
-                losses[k] = self._criteria[k](pred, targets[k])
+                losses[k] = self._criteria[k](pred, self._align(targets[k], pred))
         if not losses:
             raise ValueError('no output has both a target and a non-zero loss weight')
         return sum(self._weights[k] * loss for k, loss in losses.items()), losses
+
+    def _align(self, t, ref=None):
+        # for models spread over devices, whose outputs can end up on another device than the inputs:
+        # moves t to ref's device (targets to their output), or to the trainer's device (for the metrics)
+        device = ref.device if torch.is_tensor(ref) else self.device
+        if torch.is_tensor(t) and t.device != device:
+            return t.to(device)
+        return t
 
     @staticmethod
     def _metric_target(metric, y):
@@ -367,12 +400,12 @@ class Trainer:
     @torch.no_grad()
     def _update_metrics(self, y_pred, y):
         if self._out_keys is None:
-            self.metric.update(y_pred, self._metric_target(self.metric, y))
+            self.metric.update(self._align(y_pred), self._metric_target(self.metric, y))
             return
         preds, targets = self._split(y_pred, y)
         for k, m in self._metrics.items():
             if k in preds and targets.get(k) is not None:
-                m.update(preds[k], self._metric_target(m, targets[k]))
+                m.update(self._align(preds[k]), self._metric_target(m, self._align(targets[k])))
 
     def _compute_metrics(self):
         if self._out_keys is None:
