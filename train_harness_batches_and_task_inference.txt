@@ -1,0 +1,226 @@
+Changes to train_harness.py: task inference, checkpointing, and batch handling
+==============================================================================
+
+Status: APPLIED 2026-10-28. Sections 0-6 are in commit c11bab5; section 7 (multiple inputs and
+outputs) and the docstrings are in the commit that follows it.
+Started from a failing learner.train() in ageron/Ch14.ipynb (cell 137: IMDB sentiment
+analysis with frozen BERT embeddings + bidirectional GRU). All changes below were tested
+against small synthetic models/dataloaders in ~/.venv (torch 2.14.0, torchmetrics 1.9.0).
+
+
+0. The original error, and why the traceback was misleading
+------------------------------------------------------------
+    AttributeError: 'list' object has no attribute 'to'
+
+Cause: the notebook's collate_fn returned the labels as a plain Python list
+([[label] for review in batch]). Trainer._to_device called y.to(device) on it.
+(X was a transformers BatchEncoding, which has its own .to(), so X was fine.)
+
+The traceback pointed at _temporary_lr_schedule and at the `elif self.device.type == 'mps'`
+line, neither of which can raise this. ageron/harness.py is a symlink to train_harness.py,
+and the file had been edited after the kernel imported it: IPython shows the *old* line
+numbers next to the *current* file's text. The real frames were train() -> _to_device().
+Lesson: after editing the harness, restart the kernel or importlib.reload(harness) before
+trusting a traceback.
+
+
+1. Dataloaders assigned before task inference (your change)
+------------------------------------------------------------
+__init__ called _get_task() -- which reads self.train_dataloader -- before
+self.train_dataloader was assigned. The assignments now come first.
+
+
+2. Inferred num_classes reaches the metric (your change)
+---------------------------------------------------------
+_get_task() now returns (task, num_classes) so the default
+torchmetrics.Accuracy(task=..., num_classes=...) gets the inferred count. Before, it got
+the original argument (None), which breaks multiclass Accuracy.
+
+
+3. Metric target cast: _metric_target()
+---------------------------------------
+BCEWithLogitsLoss needs float targets; torchmetrics classification metrics are documented
+to expect int targets. So the same y may need two dtypes. The harness now casts float
+targets to long, for the metric only, when the metric is a torchmetrics classification
+metric (detected via the metric class's module). Regression metrics are untouched.
+
+Note: torchmetrics 1.9 turned out to accept float 0./1. targets for binary Accuracy, so
+this is currently a safety net rather than a required fix. It's the one place the harness
+deliberately converts types, because no single correct target dtype satisfies both the
+loss and the metric.
+
+
+4. Task inference rewritten: _get_task()
+----------------------------------------
+Old rule: binary if num_classes <= 2, where num_classes came from dataset.classes or from
+the model output via `_l[1] if len(_l) > 2 else _l[-1]`. Two bugs:
+  - 2-class models with 2 logits (CrossEntropyLoss) were labelled binary and got
+    BCEWithLogitsLoss -> "Target size ([16]) must be the same as input size ([16, 2])".
+  - Models returning shape (B,) used _l[-1] = the batch size as num_classes -> multiclass
+    with 16 classes; training ran silently with loss ~23 and accuracy 0.
+
+New rule: the task follows from the model's output, not the class count.
+  - Probe one batch through the model under torch.no_grad() in eval mode (so BatchNorm
+    running stats aren't updated), then restore the previous train/eval mode.
+  - 1 logit per sample ((B,) or (B, 1)) -> binary (BCEWithLogitsLoss, BinaryAccuracy).
+  - C logits along dim 1 ((B, C) or (B, C, L)) -> multiclass with num_classes = C,
+    even when C == 2.
+  - If num_classes (passed in, or from dataset.classes) disagrees with C, warn and use C.
+Cost: one extra forward pass at Trainer construction, but only when criterion or metric
+isn't passed.
+
+
+5. checkpoint_path=None now disables checkpointing
+--------------------------------------------------
+`checkpoint_path or f'{token}.pt'` meant None still produced a random file name, so the
+`if self.checkpoint_path is not None` guards never fired and every Trainer wrote a new .pt
+file into the working directory.
+  - default is now checkpoint_path='auto' -> random file name (old default behaviour)
+  - None -> no saving, and no reload of the best weights at the end of train()
+  - a string -> that path, as before
+Anything that passed None explicitly now gets no checkpoints.
+
+
+6. Batch handling: recursive device move, prepare_batch hook, clear errors
+--------------------------------------------------------------------------
+Design decision: be flexible about the *structure* of a batch, strict about the *types*
+inside it. The harness should not convert a list of labels to a tensor on its own because:
+  - it can't know the right dtype: torch.tensor([[0], [1]]) is long, which is right for
+    CrossEntropyLoss and wrong for BCEWithLogitsLoss -- auto-conversion just turns a clear
+    error into a confusing one inside the loss;
+  - conversion belongs in the DataLoader: collate_fn runs in worker processes, and
+    pin_memory (which makes non_blocking=True transfers overlap compute) only pins tensors;
+  - default_collate already returns tensors, so a list showing up usually means a bug in a
+    custom collate_fn.
+
+What was implemented:
+
+_move(obj, channels_last=False)
+    Moves a nested batch to the device: tensors via .to(device, non_blocking=True);
+    objects with their own .to() (e.g. BatchEncoding) via that; dicts/Mappings, lists,
+    tuples and namedtuples recursively; anything else (strings, ids kept for debugging)
+    passes through unchanged. channels_last applies to 4-D tensors anywhere in the
+    inputs, never to targets.
+
+prepare_batch=None   (new Trainer argument)
+    prepare_batch(batch) -> (X, y), called on every raw batch before the checks and the
+    device move (so it runs on CPU). For deliberate conversions, e.g.
+        prepare_batch=lambda b: (b[0], torch.tensor(b[1], dtype=torch.float32))
+    or for splitting Hugging Face-style dict batches:
+        prepare_batch=lambda b: ({k: v for k, v in b.items() if k != 'label'}, b['label'])
+    The train/evaluate loops now iterate whole batches (`for batch in loader`) so a batch
+    no longer has to unpack as (X, y) before the hook runs.
+
+_to_device(batch)   (signature changed: was _to_device(X, y))
+    Runs prepare_batch, checks the batch, then moves it. Raises TypeError when:
+      - the batch isn't an (inputs, targets) pair -- message shows what arrived and an
+        example prepare_batch that splits a dict batch;
+      - inputs or targets contain no tensors at all -- message shows the value and, for
+        targets, which dtype each common loss needs. The original IMDB bug now reads:
+          TypeError: batch targets contain no tensors: got list [[0], [1], [0], ...].
+          Return tensors from your dataset/collate_fn (e.g. torch.tensor(labels,
+          dtype=torch.float32) for BCEWithLogitsLoss, dtype=torch.long for
+          CrossEntropyLoss), or pass prepare_batch=... to Trainer to convert them.
+
+Limits:
+  - The check only rejects parts with *no* tensors. A dict with one tensor plus a stray
+    list of ints passes and fails later in the model or loss.
+  - A custom loss that takes targets with no tensors at all would be rejected; add an
+    opt-out if that's ever needed.
+  - Code outside the harness calling _to_device(X, y) must switch to _to_device((X, y)).
+
+
+7. Multiple inputs and multiple outputs
+---------------------------------------
+Multiple inputs
+    The recursive mover (section 6) already moved nested inputs; what was missing was the call.
+    New rule, in _forward(): a plain tuple of inputs is unpacked, model(*X); everything else
+    (tensor, dict, list, namedtuple, BatchEncoding) is passed as one argument, model(X).
+    Dicts are deliberately NOT unpacked into keyword arguments: models like the Ch14 IMDB model
+    take the whole encoding as one argument. For a model that wants keywords (e.g. a Hugging
+    Face model), wrap it or have prepare_batch return a tuple.
+    A dataset yielding (x1, x2, y) still needs prepare_batch=lambda b: (tuple(b[:-1]), b[-1]);
+    the "expected an (inputs, targets) pair" error now suggests exactly that.
+
+Multiple outputs
+    The model may return a tuple/list (outputs named 0, 1, ...), a namedtuple (named by field)
+    or a dict (named by key). Targets use the same structure; a single target tensor is shared
+    by every output (the usual case for auxiliary classifiers).
+
+    criterion   one loss applied to every output, or a list/dict with one per output.
+                Must be given explicitly for multi-output models (no inference).
+                Limitation: a single loss is always applied per output, so a joint loss that
+                needs all outputs at once (e.g. contrastive between heads) isn't supported.
+    metric      one metric (deep-copied per output, so their states don't mix), or a
+                list/dict with one per output; None = no metric for that output. With
+                metric=None the model gets no metrics and monitor stays on the loss.
+    loss_weights  Trainer(loss_weights=...) as a list/dict; outputs not listed get 1.0. The total
+                loss is sum(weight * loss) -- a sum, not a mean, so adding heads doesn't
+                silently shrink the gradients (same as Keras). Weight 0 skips that output's loss
+                (its metric is still tracked if it has a target).
+                train(loss_weights=...) and train_one_cycle(loss_weights=...) override them
+                for this and later runs -- the same pattern as train(lr=...). Weights live on
+                the Trainer because they define the objective that validation and checkpointing
+                use; the override covers changing them between training phases.
+    monitor     what picks the best checkpoint and drives early stopping:
+                  'loss'           the weighted validation loss (lower is better)
+                  'metric'         the metric of a single-output model
+                  <output name>    that output's metric (direction from higher_is_better)
+                Default: 'loss' for multi-output models; for single-output models it stays
+                'metric', so existing notebooks checkpoint exactly as before.
+    targets     None for an output skips its loss and metric for that batch. A target missing
+                from the dict/tuple is an error unless that output's weight is 0.
+
+    Models that return auxiliary outputs only in train mode (GoogLeNet/Inception): in eval
+    mode, a lone tensor output is treated as the first output. The output structure is always
+    taken from a train-mode forward pass -- during training, or, if evaluate() is called first,
+    from a probe batch in train mode under no_grad with all buffers (BatchNorm running stats)
+    restored afterwards.
+
+    Per-output settings are checked against the output names on the first forward pass, with
+    clear errors: entries for outputs that don't exist, outputs without a criterion, monitor on
+    an output without a metric, a missing criterion for a multi-output model, and so on.
+
+History, printout, evaluate()
+    self.history now starts empty and fills in on the first epoch (it used to start with fixed
+    keys). Single-output keys: train_loss, train_metric, valid_loss (new), valid_metric,
+    learning_rate. Multi-output adds e.g. train_loss/aux, valid_loss/aux,
+    train_metric/main, valid_metric/main.
+    The per-epoch line now also shows valid loss, and '(best)' marks the monitored value.
+    Per-output losses go to history only, to keep the line short.
+    evaluate(dl): single output -> the metric value (a float now; it used to be a 0-d tensor);
+    multi-output -> a dict of 'loss', 'loss/<name>', 'metric/<name>'.
+
+Internal restructuring
+    - train() and _evaluate() share one _run_epoch(); batches are counted, so the averages no
+      longer use len(dataloader).
+    - The probe forward pass at construction (only when criterion or metric is missing) feeds
+      _get_task(out_shape, num_classes), which is now a pure function; the cached _task is gone.
+    - _metric_target(metric, y) checks each metric separately.
+    - Fixed: train(n_epochs=0) with checkpointing used to try to load a checkpoint that was
+      never saved.
+
+Public methods (Trainer.__init__, train, train_one_cycle, evaluate, sync_optimizer,
+Initializer.use_he_init) now have docstrings describing their parameters.
+
+Tested on cpu and mps (with AMP): two-input models, tuple/dict/namedtuple outputs, per-output
+and shared criteria/metrics/targets, loss-weight overrides (checked that the total loss equals
+the weighted sum of the per-output losses), monitor on a head metric, an Inception-style aux
+model with evaluate() before train(), and every error path above. The earlier single-output
+tests still pass.
+
+
+Known, deliberately left as is
+------------------------------
+sync_optimizer() adds every model parameter missing from the optimizer, including frozen
+ones you deliberately left out. Harmless while they stay frozen (no grads), useful if you
+unfreeze later, but they always land in param_groups[0], which matters with per-group
+learning rates.
+
+
+Still to fix in ageron/Ch14.ipynb (not harness issues)
+------------------------------------------------------
+  - cell 59 (collate_fn): return labels as torch.tensor(labels, dtype=torch.float32)
+  - cell 64 (SentimentAnalysisModelPreEmbeds.forward): `hidden_state` is assigned but
+    `hidden_states` is read; add `from torch.nn.utils.rnn import pack_padded_sequence`
+  - restart the kernel so the notebook picks up the new harness
