@@ -119,20 +119,29 @@ class Trainer:
         self.model = model if spread else model.to(self.device)
         self.optimizer = optimizer or torch.optim.AdamW(self.model.parameters(), lr=default_lr, weight_decay=weight_decay)
 
+        criterion_note = metric_note = ''
         if metric is None or criterion is None:
             y_pred = self._probe()
             if self._heads(y_pred) is not None:
                 if criterion is None:
                     raise ValueError("the model returns multiple outputs, so the loss can't be inferred: pass "
                                      'criterion= (one loss for every output, or a list/dict with one per output)')
+                if metric is None:
+                    metric_note = ' (default for multiple outputs)'
             else:
                 task, num_classes = self._get_task(y_pred.shape, num_classes)
+                inferred = f' (default, inferred {task} task' + (f' with {num_classes} classes)' if task == 'multiclass' else ')')
                 if metric is None:
                     metric = torchmetrics.Accuracy(task=task, num_classes=num_classes)
+                    metric_note = inferred
                 if criterion is None:
                     criterion = nn.BCEWithLogitsLoss() if task == 'binary' else nn.CrossEntropyLoss()
+                    criterion_note = inferred
         self.criterion = criterion
         self.metric = metric
+        # the defaults are guessed from the output shape, so say what was picked
+        print(f'Criterion: {self._describe_spec(criterion)}{criterion_note}')
+        print(f'Metric: {self._describe_spec(metric)}{metric_note}')
         self.loss_weights = loss_weights
         self.monitor = monitor
         # single vs multiple outputs is settled on the first training/validation forward pass
@@ -278,6 +287,17 @@ class Trainer:
         if isinstance(obj, (list, tuple)):
             return dict(enumerate(obj))
         return None
+
+    @staticmethod
+    def _describe_spec(spec):
+        # a short name for a criterion/metric setting, which may be a list/dict with one per output
+        if spec is None:
+            return 'none'
+        if isinstance(spec, Mapping):
+            return '{' + ', '.join(f'{k}: {Trainer._describe_spec(v)}' for k, v in spec.items()) + '}'
+        if isinstance(spec, (list, tuple)):
+            return '[' + ', '.join(Trainer._describe_spec(v) for v in spec) + ']'
+        return type(spec).__name__
 
     @staticmethod
     def _per_head(spec, keys, name, default=None, broadcast=lambda v: v):
