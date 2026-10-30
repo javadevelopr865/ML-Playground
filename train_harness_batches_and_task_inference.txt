@@ -257,9 +257,3 @@ unfreeze later, but they always land in param_groups[0], which matters with per-
 learning rates.
 
 
-Still to fix in ageron/Ch14.ipynb (not harness issues)
-------------------------------------------------------
-  - cell 59 (collate_fn): return labels as torch.tensor(labels, dtype=torch.float32)
-  - cell 64 (SentimentAnalysisModelPreEmbeds.forward): `hidden_state` is assigned but
-    `hidden_states` is read; add `from torch.nn.utils.rnn import pack_padded_sequence`
-  - restart the kernel so the notebook picks up the new harness
