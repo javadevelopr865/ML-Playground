@@ -1,8 +1,23 @@
 TRAIN HARNESS (train_harness.py) - CHANGES AND USAGE NOTES
 ==========================================================
-Date: 2026-10-16
 
-This file summarises the review of the Trainer class in train_harness.py:
+One file of notes on the Trainer harness, oldest changes first. Later parts
+supersede earlier ones where they disagree; those places are marked.
+
+  PART 1. Review, bug and performance fixes, AMP/compile, usage (2026-10-16)
+  PART 2. Keeping the optimizer in sync with the model (2026-10-17)
+  PART 3. Task inference, checkpointing, batches, multiple inputs/outputs,
+          device placement (2026-10-28)
+  PART 4. Setup summary, verbose, progress bars, speed check (2026-10-30)
+
+(Parts 2 and 3 were train_harness_sync_optimizer.txt and
+train_harness_batches_and_task_inference.txt.)
+
+
+======================================================================
+PART 1. REVIEW, FIXES, AMP/COMPILE, USAGE (2026-10-16)
+======================================================================
+This part summarises the review of the Trainer class in train_harness.py:
 what was wrong or slow, what was changed and why, the new optional
 arguments, and the DataLoader settings to use alongside it.
 
@@ -39,7 +54,8 @@ documented to work, not on a test run.
      Fix: num_classes comes from dataset.classes, unwrapping nested
      Subsets. There is also a new num_classes= argument for datasets
      without a .classes attribute. The task string is now lowercase
-     ('binary' / 'multiclass').
+     ('binary' / 'multiclass'). (Since replaced: the task and class
+     count now follow the model's output; see Part 3, section 4.)
 
 1.3  A metric you passed in was not moved to the device
      Problem: `metric.device = device` does not move a torchmetrics
@@ -97,7 +113,8 @@ documented to work, not on a test run.
 Behaviour changes to know about:
 - self.device is now a torch.device, not a string.
 - If you build a Trainer on a dataset without a .classes attribute and
-  don't pass a metric, you now need to pass num_classes=.
+  don't pass a metric, you now need to pass num_classes=. (No longer
+  true: the class count is inferred from the model; see Part 3, section 4.)
 
 
 ----------------------------------------------------------------------
@@ -140,7 +157,8 @@ Behaviour changes to know about:
          (argmax); for probability-sensitive metrics pass
          y_pred.float().
        - On MPS, time a few epochs with amp=False and amp=True before
-         relying on it.
+         relying on it. (Measured: fp16 AMP was ~30% slower for a small
+         GRU model on mps; see Part 4, section 5.)
 
 4.2  torch.compile
      What it does: a just-in-time compiler for the model. Instead of
@@ -289,7 +307,414 @@ Training:
   trainer.train_one_cycle(n_epochs=..., max_lr=...)   # OneCycle, stepped per batch
   trainer.train(n_epochs=...)                         # any per-epoch scheduler
   trainer.evaluate(dataloader)
-  trainer.history  # dict: train_loss, train_metric, valid_metric, learning_rate
+  trainer.history  # dict: train_loss, train_metric, valid_loss, valid_metric,
+                   # learning_rate (+ per-output keys; see Part 3, section 7)
 
 Initialization (now covers conv layers):
   model.apply(Initializer.use_he_init)
+
+
+======================================================================
+PART 2. KEEPING THE OPTIMIZER IN SYNC WITH THE MODEL (2026-10-17)
+======================================================================
+Status: APPLIED in commit a995d6a. Written 2026-10-17 as a plan; implemented as written:
+Trainer.sync_optimizer(), called as the first line of train().
+
+Problem
+-------
+Trainer.self.model is the same object the caller holds, so in-place changes are shared.
+But the optimizer was built from the model's parameters at __init__ time. If layers or
+parameters are swapped afterwards (e.g. model.fc = nn.Linear(...)), the optimizer keeps
+updating the old, now-detached parameters and the new layer never trains.
+
+Approach
+--------
+Patch the existing optimizer in place rather than building a new one:
+  - the lr_scheduler and GradScaler hold references to self.optimizer, so a new optimizer
+    would orphan the scheduler;
+  - optimizer.state is keyed by Parameter objects, so state (Adam moments, step counts) for
+    untouched parameters is kept automatically.
+
+Rules:
+  - parameters no longer in the model are removed from their group, and their state dropped;
+  - new parameters are appended to param group 0 (NOT add_param_group(): schedulers record
+    one base lr per group at construction, so a new group breaks an existing scheduler);
+  - a parameter whose tensor was replaced with a different shape (p.data = ...) keeps its
+    identity, so its stale state is reset to avoid a shape error on the next step;
+  - a warning is emitted only when something changed, so the event isn't silent.
+
+Implementation
+--------------
+Trainer.sync_optimizer() applies the rules above; train() calls it first. No other changes
+were needed: the compiled _fwd wraps the same module (structural changes just trigger a
+recompile), and train_one_cycle() goes through train().
+
+Known limitations / decisions to revisit
+----------------------------------------
+- With multiple param groups (e.g. backbone vs head lrs), new params always land in group 0.
+  If that matters, add a parameter such as sync_optimizer(group=0).
+- If the caller built an optimizer over only trainable params (filtered on requires_grad),
+  sync will add the frozen ones to group 0. Harmless (they have no grad, so steps skip them),
+  but they will appear in the optimizer.
+- A group whose params are all removed is left as an empty group (torch tolerates this), so
+  scheduler group counts stay consistent.
+
+Tested (scratchpad prototype)
+-----------------------------
+- Swapping the last Linear layer: warning reports 2 added / 2 removed; Adam state of
+  untouched layers is unchanged; the new layer joins group 0 and gets state after training;
+  an existing StepLR scheduler keeps working.
+- Calling it again with no changes: no warning.
+- Replacing a tensor via .data with a different shape: its state is reset; same shape: kept.
+
+
+======================================================================
+PART 3. TASK INFERENCE, CHECKPOINTING, BATCHES, INPUTS/OUTPUTS, DEVICES (2026-10-28)
+======================================================================
+Status: APPLIED 2026-10-28. Sections 0-6 are in commit c11bab5; section 7 (multiple inputs and
+outputs) and the docstrings are in the commit that follows it; section 8 (device placement) in
+the one after that.
+Started from a failing learner.train() in ageron/Ch14.ipynb (cell 137: IMDB sentiment
+analysis with frozen BERT embeddings + bidirectional GRU). All changes below were tested
+against small synthetic models/dataloaders in ~/.venv (torch 2.14.0, torchmetrics 1.9.0).
+
+
+0. The original error, and why the traceback was misleading
+------------------------------------------------------------
+    AttributeError: 'list' object has no attribute 'to'
+
+Cause: the notebook's collate_fn returned the labels as a plain Python list
+([[label] for review in batch]). Trainer._to_device called y.to(device) on it.
+(X was a transformers BatchEncoding, which has its own .to(), so X was fine.)
+
+The traceback pointed at _temporary_lr_schedule and at the `elif self.device.type == 'mps'`
+line, neither of which can raise this. ageron/harness.py is a symlink to train_harness.py,
+and the file had been edited after the kernel imported it: IPython shows the *old* line
+numbers next to the *current* file's text. The real frames were train() -> _to_device().
+Lesson: after editing the harness, restart the kernel or importlib.reload(harness) before
+trusting a traceback.
+
+
+1. Dataloaders assigned before task inference (your change)
+------------------------------------------------------------
+__init__ called _get_task() -- which reads self.train_dataloader -- before
+self.train_dataloader was assigned. The assignments now come first.
+
+
+2. Inferred num_classes reaches the metric (your change)
+---------------------------------------------------------
+_get_task() now returns (task, num_classes) so the default
+torchmetrics.Accuracy(task=..., num_classes=...) gets the inferred count. Before, it got
+the original argument (None), which breaks multiclass Accuracy.
+
+
+3. Metric target cast: _metric_target()
+---------------------------------------
+BCEWithLogitsLoss needs float targets; torchmetrics classification metrics are documented
+to expect int targets. So the same y may need two dtypes. The harness now casts float
+targets to long, for the metric only, when the metric is a torchmetrics classification
+metric (detected via the metric class's module). Regression metrics are untouched.
+
+Note: torchmetrics 1.9 turned out to accept float 0./1. targets for binary Accuracy, so
+this is currently a safety net rather than a required fix. It's the one place the harness
+deliberately converts types, because no single correct target dtype satisfies both the
+loss and the metric.
+
+
+4. Task inference rewritten: _get_task()
+----------------------------------------
+Old rule: binary if num_classes <= 2, where num_classes came from dataset.classes or from
+the model output via `_l[1] if len(_l) > 2 else _l[-1]`. Two bugs:
+  - 2-class models with 2 logits (CrossEntropyLoss) were labelled binary and got
+    BCEWithLogitsLoss -> "Target size ([16]) must be the same as input size ([16, 2])".
+  - Models returning shape (B,) used _l[-1] = the batch size as num_classes -> multiclass
+    with 16 classes; training ran silently with loss ~23 and accuracy 0.
+
+New rule: the task follows from the model's output, not the class count.
+  - Probe one batch through the model under torch.no_grad() in eval mode (so BatchNorm
+    running stats aren't updated), then restore the previous train/eval mode.
+  - 1 logit per sample ((B,) or (B, 1)) -> binary (BCEWithLogitsLoss, BinaryAccuracy).
+  - C logits along dim 1 ((B, C) or (B, C, L)) -> multiclass with num_classes = C,
+    even when C == 2.
+  - If num_classes (passed in, or from dataset.classes) disagrees with C, warn and use C.
+Cost: one extra forward pass at Trainer construction, but only when criterion or metric
+isn't passed.
+
+
+5. checkpoint_path=None now disables checkpointing
+--------------------------------------------------
+`checkpoint_path or f'{token}.pt'` meant None still produced a random file name, so the
+`if self.checkpoint_path is not None` guards never fired and every Trainer wrote a new .pt
+file into the working directory.
+  - default is now checkpoint_path='auto' -> random file name (old default behaviour)
+  - None -> no saving, and no reload of the best weights at the end of train()
+  - a string -> that path, as before
+Anything that passed None explicitly now gets no checkpoints.
+
+
+6. Batch handling: recursive device move, prepare_batch hook, clear errors
+--------------------------------------------------------------------------
+Design decision: be flexible about the *structure* of a batch, strict about the *types*
+inside it. The harness should not convert a list of labels to a tensor on its own because:
+  - it can't know the right dtype: torch.tensor([[0], [1]]) is long, which is right for
+    CrossEntropyLoss and wrong for BCEWithLogitsLoss -- auto-conversion just turns a clear
+    error into a confusing one inside the loss;
+  - conversion belongs in the DataLoader: collate_fn runs in worker processes, and
+    pin_memory (which makes non_blocking=True transfers overlap compute) only pins tensors;
+  - default_collate already returns tensors, so a list showing up usually means a bug in a
+    custom collate_fn.
+
+What was implemented:
+
+_move(obj, channels_last=False)
+    Moves a nested batch to the device: tensors via .to(device, non_blocking=True);
+    objects with their own .to() (e.g. BatchEncoding) via that; dicts/Mappings, lists,
+    tuples and namedtuples recursively; anything else (strings, ids kept for debugging)
+    passes through unchanged. channels_last applies to 4-D tensors anywhere in the
+    inputs, never to targets.
+
+prepare_batch=None   (new Trainer argument)
+    prepare_batch(batch) -> (X, y), called on every raw batch before the checks and the
+    device move (so it runs on CPU). For deliberate conversions, e.g.
+        prepare_batch=lambda b: (b[0], torch.tensor(b[1], dtype=torch.float32))
+    or for splitting Hugging Face-style dict batches:
+        prepare_batch=lambda b: ({k: v for k, v in b.items() if k != 'label'}, b['label'])
+    The train/evaluate loops now iterate whole batches (`for batch in loader`) so a batch
+    no longer has to unpack as (X, y) before the hook runs.
+
+_to_device(batch)   (signature changed: was _to_device(X, y))
+    Runs prepare_batch, checks the batch, then moves it. Raises TypeError when:
+      - the batch isn't an (inputs, targets) pair -- message shows what arrived and an
+        example prepare_batch that splits a dict batch;
+      - inputs or targets contain no tensors at all -- message shows the value and, for
+        targets, which dtype each common loss needs. The original IMDB bug now reads:
+          TypeError: batch targets contain no tensors: got list [[0], [1], [0], ...].
+          Return tensors from your dataset/collate_fn (e.g. torch.tensor(labels,
+          dtype=torch.float32) for BCEWithLogitsLoss, dtype=torch.long for
+          CrossEntropyLoss), or pass prepare_batch=... to Trainer to convert them.
+
+Limits:
+  - The check only rejects parts with *no* tensors. A dict with one tensor plus a stray
+    list of ints passes and fails later in the model or loss.
+  - A custom loss that takes targets with no tensors at all would be rejected; add an
+    opt-out if that's ever needed.
+  - Code outside the harness calling _to_device(X, y) must switch to _to_device((X, y)).
+
+
+7. Multiple inputs and multiple outputs
+---------------------------------------
+Multiple inputs
+    The recursive mover (section 6) already moved nested inputs; what was missing was the call.
+    New rule, in _forward(): a plain tuple of inputs is unpacked, model(*X); everything else
+    (tensor, dict, list, namedtuple, BatchEncoding) is passed as one argument, model(X).
+    Dicts are deliberately NOT unpacked into keyword arguments: models like the Ch14 IMDB model
+    take the whole encoding as one argument. For a model that wants keywords (e.g. a Hugging
+    Face model), wrap it or have prepare_batch return a tuple.
+    A dataset yielding (x1, x2, y) still needs prepare_batch=lambda b: (tuple(b[:-1]), b[-1]);
+    the "expected an (inputs, targets) pair" error now suggests exactly that.
+
+Multiple outputs
+    The model may return a tuple/list (outputs named 0, 1, ...), a namedtuple (named by field)
+    or a dict (named by key). Targets use the same structure; a single target tensor is shared
+    by every output (the usual case for auxiliary classifiers).
+
+    criterion   one loss applied to every output, or a list/dict with one per output.
+                Must be given explicitly for multi-output models (no inference).
+                Limitation: a single loss is always applied per output, so a joint loss that
+                needs all outputs at once (e.g. contrastive between heads) isn't supported.
+    metric      one metric (deep-copied per output, so their states don't mix), or a
+                list/dict with one per output; None = no metric for that output. With
+                metric=None the model gets no metrics and monitor stays on the loss.
+    loss_weights  Trainer(loss_weights=...) as a list/dict; outputs not listed get 1.0. The total
+                loss is sum(weight * loss) -- a sum, not a mean, so adding heads doesn't
+                silently shrink the gradients (same as Keras). Weight 0 skips that output's loss
+                (its metric is still tracked if it has a target).
+                train(loss_weights=...) and train_one_cycle(loss_weights=...) override them
+                for this and later runs -- the same pattern as train(lr=...). Weights live on
+                the Trainer because they define the objective that validation and checkpointing
+                use; the override covers changing them between training phases.
+    monitor     what picks the best checkpoint and drives early stopping:
+                  'loss'           the weighted validation loss (lower is better)
+                  'metric'         the metric of a single-output model
+                  <output name>    that output's metric (direction from higher_is_better)
+                Default: 'loss' for multi-output models; for single-output models it stays
+                'metric', so existing notebooks checkpoint exactly as before.
+    targets     None for an output skips its loss and metric for that batch. A target missing
+                from the dict/tuple is an error unless that output's weight is 0.
+
+    Models that return auxiliary outputs only in train mode (GoogLeNet/Inception): in eval
+    mode, a lone tensor output is treated as the first output. The output structure is always
+    taken from a train-mode forward pass -- during training, or, if evaluate() is called first,
+    from a probe batch in train mode under no_grad with all buffers (BatchNorm running stats)
+    restored afterwards.
+
+    Per-output settings are checked against the output names on the first forward pass, with
+    clear errors: entries for outputs that don't exist, outputs without a criterion, monitor on
+    an output without a metric, a missing criterion for a multi-output model, and so on.
+
+History, printout, evaluate()
+    self.history now starts empty and fills in on the first epoch (it used to start with fixed
+    keys). Single-output keys: train_loss, train_metric, valid_loss (new), valid_metric,
+    learning_rate. Multi-output adds e.g. train_loss/aux, valid_loss/aux,
+    train_metric/main, valid_metric/main.
+    The per-epoch line now also shows valid loss, and '(best)' marks the monitored value.
+    Per-output losses go to history only, to keep the line short.
+    evaluate(dl): single output -> the metric value (a float now; it used to be a 0-d tensor);
+    multi-output -> a dict of 'loss', 'loss/<name>', 'metric/<name>'.
+
+Internal restructuring
+    - train() and _evaluate() share one _run_epoch(); batches are counted, so the averages no
+      longer use len(dataloader).
+    - The probe forward pass at construction (only when criterion or metric is missing) feeds
+      _get_task(out_shape, num_classes), which is now a pure function; the cached _task is gone.
+    - _metric_target(metric, y) checks each metric separately.
+    - Fixed: train(n_epochs=0) with checkpointing used to try to load a checkpoint that was
+      never saved.
+
+Public methods (Trainer.__init__, train, train_one_cycle, evaluate, sync_optimizer,
+Initializer.use_he_init) now have docstrings describing their parameters.
+
+Tested on cpu and mps (with AMP) -- see section 8 for device placement: two-input models, tuple/dict/namedtuple outputs, per-output
+and shared criteria/metrics/targets, loss-weight overrides (checked that the total loss equals
+the weighted sum of the per-output losses), monitor on a head metric, an Inception-style aux
+model with evaluate() before train(), and every error path above. The earlier single-output
+tests still pass.
+
+
+
+8. Device placement: device='auto' / 'model', models spread over devices
+-------------------------------------------------------------------------
+Problem: with device not given, a model on the cpu was silently moved to mps/cuda. Moving a
+model to the cpu on purpose (e.g. to work around the Ch14 "scaled_dot_product_attention for
+MPS does not support dropout" error) therefore had no effect, and nothing said why.
+
+Intent can't be detected: a freshly built model and one moved with .to('cpu') are identical
+(.to('cpu') on a cpu model is a no-op and PyTorch records no history of .to() calls). The one
+real signal is a model spread over several devices -- nobody does that by accident.
+
+So instead of guessing, the move is made visible and can be switched off:
+  device='auto'   (default; None means the same) a model on an accelerator stays where it is;
+                  a cpu model is moved to cuda/mps when available, with a warning:
+                    Trainer moved the model from cpu to mps; pass device='cpu' to train on the
+                    cpu, or device='model' to always keep the model where it is.
+  device='model'  always keep the model where it is.
+  'cpu', 'mps', torch.device(...)   used exactly as given (no warning).
+
+Why 'auto' stays the default rather than 'model': keeping the model in place is more
+predictable, but fails silently the other way -- forget .to(device) once and a BERT model
+trains on the cpu at a fraction of the speed. The warning gives most of the predictability
+without breaking notebooks that rely on the automatic move.
+
+Models spread over several devices (parameters and buffers on more than one device):
+  - 'auto' and 'model' never move them; inputs go to the device of the first parameter.
+  - an explicit single device raises a ValueError instead of collapsing the model onto it.
+  - targets are moved to the device of the output they belong to before the loss, and outputs
+    and targets are moved to the trainer's device for the metrics (_align()).
+  - mixed precision is turned off, with a warning, when the devices are of different types
+    (e.g. mps + cpu): torch.autocast covers one device type, so the cpu half got fp16 inputs
+    from the mps half and failed with "mat1 and mat2 must have the same dtype".
+
+Tested on mps: every placement combination above (cpu/mps models x default/None/'cpu'/
+torch.device/'model'/'mps'), a model split over mps and cpu trained end to end, and all the
+earlier test suites on cpu and mps.
+
+
+Known, deliberately left as is
+------------------------------
+sync_optimizer() adds every model parameter missing from the optimizer, including frozen
+ones you deliberately left out. Harmless while they stay frozen (no grads), useful if you
+unfreeze later, but they always land in param_groups[0], which matters with per-group
+learning rates.
+
+
+======================================================================
+PART 4. SETUP SUMMARY, verbose, PROGRESS BARS, SPEED CHECK (2026-10-30)
+======================================================================
+
+Status: APPLIED 2026-10-30. The first criterion/metric printout is in commit aae893e; the rest
+is in the commit that follows it.
+Tested on cpu and mps with small synthetic models (torch 2.14, tqdm 4.70, ipywidgets 8.1);
+the Jupyter widget bars were not checked in a notebook.
+
+
+1. Setup summary at construction
+--------------------------------
+Several settings are defaults or guessed from the model's output, so Trainer() now prints
+what it picked (example for the Ch14 NMT model):
+
+    Trainer setup
+      device:        mps (moved from cpu)
+      model:         NmtModel, 12.4M params (12.4M trainable)
+      criterion:     CrossEntropyLoss (default, inferred multiclass task with 10000 classes)
+      metric:        MulticlassAccuracy (default, inferred multiclass task with 10000 classes)
+      optimizer:     AdamW (default), lr 0.001, weight decay 0.001
+      scheduler:     none
+      amp:           on, float16 with GradScaler
+      checkpoint:    3f9a1c2e7b4d5a60.pt (best weights are restored after training)
+      data:          train 1,250 batches of 32 | valid 157 batches of 32
+
+  - device: notes "(moved from cpu)" for the automatic move (the warning from Part 3,
+    section 8 is still raised) or "(spread over ...)" for a split model.
+  - model: the trainable count shows whether a frozen backbone is really frozen.
+  - criterion/metric: "(default, inferred ...)" when guessed from the output shape;
+    multi-output settings print per output, e.g. {main: CrossEntropyLoss, aux: none}.
+  - amp: when off, says why: amp=False, not supported on the device (cpu), or the model
+    is spread over more than one device type.
+  - compile and channels_last only get a line when they are on.
+  - data: an iterable dataset with no length shows "unknown number of batches".
+
+2. Messages during and after training
+-------------------------------------
+  - On the first forward pass: "Monitoring: valid metric (higher is better)" -- what picks
+    the checkpoint and drives early stopping, which used to be silent. Multi-output models
+    also get "Outputs: main (loss weight 1, metric MulticlassAccuracy), aux (...)".
+  - train_one_cycle(): "Scheduler: OneCycleLR for this run, max lr 0.01, stepped every batch".
+  - The epoch line shows validation time too: "| in 4.3s + 0.6s valid |". Before, the time
+    covered the training pass only.
+  - Early stopping: "Early stopping: no improvement for 3 epochs".
+  - At the end: "Restored the best weights, from epoch 3 (valid metric: 0.8712)".
+
+3. verbose=True   (new Trainer argument)
+-----------------------------------------
+verbose=False turns off everything above, the per-epoch lines and the progress bars, e.g.
+for hyperparameter sweeps. Warnings are still shown. Can be changed later: trainer.verbose.
+
+4. Progress bars: progress=True   (new Trainer argument)
+-------------------------------------------------------
+  - An overall bar over the epochs, showing the best valid score so far. It stays when the
+    run ends, e.g. at 7/20 after early stopping.
+  - A bar for each epoch's training batches and one for validation; both disappear when done.
+  - The per-epoch lines and the Outputs/Monitoring lines are printed with tqdm.write(), so
+    they appear above the bars and remain as a record afterwards.
+  - The batch bar shows the running loss, refreshed every 25 batches (class attribute
+    Trainer._postfix_every). Reading the loss makes the cpu wait for the gpu -- the per-batch
+    sync the harness otherwise avoids -- so it is not done every batch, and not at all
+    when the bars are off.
+  - tqdm.auto: widget bars in Jupyter (needs ipywidgets), text bars in a terminal.
+  - Off when verbose=False. Can be changed later: trainer.progress.
+  - If tqdm isn't installed the harness still works, without bars (_NoBar stands in).
+  - Re-running the section 5 benchmark with bars on gave the same times.
+
+5. Speed check: harness vs the notebook train() loop
+----------------------------------------------------
+Question: is the harness much slower than the plain loop in ageron/Ch14.ipynb? No.
+Benchmark (2-layer GRU, vocab 2000, 4096 sequences, batch 32, NAdam, mps, warm-up epoch first):
+
+    Loop                                  Time per epoch (train + valid)
+    notebook train()/evaluate_tm()        3.90 s
+    harness, defaults                     4.54 s
+    harness, amp=False                    3.45 s
+
+  - The harness's extra Python per batch costs microseconds; with amp=False it beats the
+    notebook loop, which calls loss.item() (a cpu-gpu sync) every batch.
+  - The default fp16 autocast + GradScaler costs ~30% on mps for this model. On a Mac with
+    small models, try amp=False (Part 1, section 4.1 already suggests timing both).
+  - The "orders of magnitude faster" impression came from Ch14 cell 119: that run's loss was
+    stuck at 9.2211 with accuracy 0.0000, on the same nmt_model/optimizer the harness had
+    just trained at lr=0.01, so it was not a fair comparison.
+
+6. Fixed along the way
+----------------------
+The criterion/metric printout in aae893e added a second _describe() method, which replaced
+the existing _describe(obj) used by the batch-format error messages. The new one is now
+_describe_spec().

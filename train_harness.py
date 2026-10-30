@@ -15,6 +15,24 @@ import torch.nn as nn
 import torchmetrics
 import time, secrets, warnings, contextlib, reprlib, copy
 from collections.abc import Mapping
+try:
+    from tqdm.auto import tqdm   # widget bars in Jupyter, text bars in a terminal
+except ImportError:
+    tqdm = None
+
+
+class _NoBar:
+    # stands in for a tqdm bar when progress bars are off or tqdm isn't installed
+    def __init__(self, iterable=None, **kwargs):
+        self.iterable = iterable
+    def __iter__(self):
+        return iter(self.iterable)
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        return False
+    def update(self, n=1): pass
+    def set_postfix(self, *args, **kwargs): pass
 
 class Initializer:
     @staticmethod
@@ -51,6 +69,8 @@ class Trainer:
             prepare_batch=None,
             loss_weights=None,
             monitor=None,
+            verbose=True,
+            progress=True,
             ):
         """Training loop with mixed precision, checkpointing, early stopping and lr scheduling.
 
@@ -85,7 +105,13 @@ class Trainer:
         monitor: what picks the best checkpoint and drives early stopping: 'loss' (the weighted
             validation loss), 'metric' (single output), or the name/index of an output with a metric.
             Default: 'metric' for single-output models, 'loss' for multiple outputs.
+        verbose: print a summary of the setup, what is monitored, each epoch's results and which
+            checkpoint was restored. Warnings are shown either way. Can be changed later via .verbose.
+        progress: show tqdm progress bars, one over the epochs and one for each epoch's batches
+            (off when verbose=False or tqdm isn't installed). Can be changed later via .progress.
         """
+        self.verbose = verbose
+        self.progress = progress
         self.channels_last = channels_last
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
@@ -98,6 +124,7 @@ class Trainer:
         # model to an accelerator but says so; a model spread over several devices was placed on purpose
         model_devices = {t.device for t in (*model.parameters(), *model.buffers())}
         spread = len(model_devices) > 1
+        device_note = ' (spread over ' + ', '.join(sorted(map(str, model_devices))) + ')' if spread else ''
         if device is None or device in ('auto', 'model'):
             placement = device or 'auto'
             if spread:
@@ -109,6 +136,7 @@ class Trainer:
                     warnings.warn(f"Trainer moved the model from cpu to {best}; pass device='cpu' to train "
                                   "on the cpu, or device='model' to always keep the model where it is.")
                     device = best
+                    device_note = ' (moved from cpu)'
         elif spread:
             raise ValueError(f'the model is spread over {sorted(map(str, model_devices))}; moving it all to {device} '
                              "would undo that. Pass device='model' to keep it as placed, or move it yourself first.")
@@ -117,6 +145,7 @@ class Trainer:
         self.device = torch.device(device)
 
         self.model = model if spread else model.to(self.device)
+        optimizer_note = '' if optimizer else ' (default)'
         self.optimizer = optimizer or torch.optim.AdamW(self.model.parameters(), lr=default_lr, weight_decay=weight_decay)
 
         criterion_note = metric_note = ''
@@ -139,9 +168,6 @@ class Trainer:
                     criterion_note = inferred
         self.criterion = criterion
         self.metric = metric
-        # the defaults are guessed from the output shape, so say what was picked
-        print(f'Criterion: {self._describe_spec(criterion)}{criterion_note}')
-        print(f'Metric: {self._describe_spec(metric)}{metric_note}')
         self.loss_weights = loss_weights
         self.monitor = monitor
         # single vs multiple outputs is settled on the first training/validation forward pass
@@ -162,10 +188,12 @@ class Trainer:
             else:
                 amp_dtype = torch.float16
         self.amp_enabled = amp and self.device.type in ('cuda', 'mps')
+        amp_note = 'off (amp=False)' if not amp else f'off (not supported on {self.device.type})'
         # autocast covers a single device type, so a model spread over e.g. mps and cpu would mix dtypes
         if self.amp_enabled and len({d.type for d in model_devices}) > 1:
             warnings.warn('mixed precision is disabled: the model is spread over more than one device type.')
             self.amp_enabled = False
+            amp_note = 'off (the model is spread over more than one device type)'
         self.amp_dtype = amp_dtype
         self.scaler = torch.amp.GradScaler(self.device.type,
                                            enabled=self.amp_enabled and amp_dtype is torch.float16)
@@ -184,6 +212,37 @@ class Trainer:
 
         # train_/valid_ loss and metric per epoch; with multiple outputs also per output, e.g. 'valid_metric/aux'
         self.history = {}
+
+        if self.verbose:
+            # several of these are defaults or guessed from the model's output, so say what was picked
+            n_params = sum(p.numel() for p in self.model.parameters())
+            n_trainable = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
+            group = self.optimizer.param_groups[0]
+            if self.amp_enabled:
+                amp_note = 'on, ' + str(amp_dtype).removeprefix('torch.') + (
+                    ' with GradScaler' if self.scaler.is_enabled() else '')
+            rows = {
+                'device': f'{self.device}{device_note}',
+                'model': f'{type(self.model).__name__}, {self._count(n_params)} params '
+                         f'({self._count(n_trainable)} trainable)',
+                'criterion': f'{self._describe_spec(criterion)}{criterion_note}',
+                'metric': f'{self._describe_spec(metric)}{metric_note}',
+                'optimizer': f'{type(self.optimizer).__name__}{optimizer_note}, lr {group["lr"]:g}'
+                             + (f', weight decay {group["weight_decay"]:g}' if group.get('weight_decay') else ''),
+                'scheduler': f'{type(lr_scheduler).__name__}, stepped every epoch' if lr_scheduler else 'none',
+                'amp': amp_note,
+                'compile': f'on ({compile if isinstance(compile, str) else "default mode"})' if compile else None,
+                'channels_last': 'on' if channels_last else None,
+                'checkpoint': f'{self.checkpoint_path} (best weights are restored after training)'
+                              if self.checkpoint_path else 'off (the final weights are kept)',
+                'data': f'train {self._describe_loader(train_dataloader)} | '
+                        f'valid {self._describe_loader(valid_dataloader)}',
+            }
+            width = max(map(len, rows)) + 2
+            print('Trainer setup')
+            for name, value in rows.items():
+                if value is not None:
+                    print(f'  {name + ":":<{width}}{value}')
 
 
     @staticmethod
@@ -289,6 +348,23 @@ class Trainer:
         return None
 
     @staticmethod
+    def _count(n):
+        for unit, size in (('B', 1e9), ('M', 1e6), ('K', 1e3)):
+            if n >= size:
+                return f'{n / size:.1f}{unit}'
+        return str(n)
+
+    @staticmethod
+    def _describe_loader(loader):
+        # an iterable dataset may have no length, and a custom batch_sampler no batch_size
+        try:
+            text = f'{len(loader):,} batches'
+        except TypeError:
+            text = 'unknown number of batches'
+        batch_size = getattr(loader, 'batch_size', None)
+        return text + (f' of {batch_size}' if batch_size else '')
+
+    @staticmethod
     def _describe_spec(spec):
         # a short name for a criterion/metric setting, which may be a list/dict with one per output
         if spec is None:
@@ -351,6 +427,13 @@ class Trainer:
             m = self._metrics[None if monitor == 'metric' else monitor]
             self.higher_is_better = getattr(m, 'higher_is_better', None) is not False
         self._outputs_ready = True
+        if self.verbose:
+            if self._out_keys is not None:
+                self._print('Outputs: ' + ', '.join(
+                    f'{k} (loss weight {self._weights[k]:g}, '
+                    f'metric {self._describe_spec(self._metrics.get(k))})' for k in self._out_keys))
+            self._print(f'Monitoring: valid {self._monitor_key.replace("/", " ")} '
+                  f'({"higher" if self.higher_is_better else "lower"} is better)')
 
     def _check_loss_config(self):
         criteria = self._per_head(self.criterion, self._out_keys, 'criterion')
@@ -434,10 +517,23 @@ class Trainer:
         return {f'metric/{k}': m.compute().item() for k, m in self._metrics.items()
                 if getattr(m, '_update_count', 1) > 0}
 
+    # how often the batch bar shows the running loss; reading it makes the cpu wait for the gpu
+    _postfix_every = 25
+
+    def _bars_on(self):
+        return self.progress and self.verbose and tqdm is not None
+
+    def _bar(self, iterable=None, **kwargs):
+        return tqdm(iterable, dynamic_ncols=True, **kwargs) if self._bars_on() else _NoBar(iterable)
+
+    def _print(self, msg):
+        # tqdm.write prints above the progress bars instead of breaking them
+        (tqdm.write if tqdm is not None else print)(msg)
+
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
 
-    def _run_epoch(self, dataLoader, training):
+    def _run_epoch(self, dataLoader, training, desc=None):
         # one pass over dataLoader (with optimizer steps when training); returns the mean loss per batch,
         # per-output losses and metrics, e.g. {'loss': ..., 'loss/aux': ..., 'metric/aux': ...}
         if self._outputs_ready:
@@ -447,28 +543,31 @@ class Trainer:
         total_loss = torch.zeros((), device=self.device)
         head_losses = {}
         n_batches = 0
-        for batch in dataLoader:
-            X, y = self._to_device(batch)
-            with self._autocast():
-                y_pred = self._forward(X)
-                if not self._outputs_ready:
-                    self._setup_outputs(y_pred)
-                loss, losses = self._compute_loss(y_pred, y)
-            if training:
-                # scaler is a no-op unless training in fp16
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                self.optimizer.zero_grad()
+        with self._bar(dataLoader, desc=desc, unit='batch', leave=False) as bar:
+            for batch in bar:
+                X, y = self._to_device(batch)
+                with self._autocast():
+                    y_pred = self._forward(X)
+                    if not self._outputs_ready:
+                        self._setup_outputs(y_pred)
+                    loss, losses = self._compute_loss(y_pred, y)
+                if training:
+                    # scaler is a no-op unless training in fp16
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                    self.optimizer.zero_grad()
 
-                if self._step_per_batch:
-                    self.lr_scheduler.step()
+                    if self._step_per_batch:
+                        self.lr_scheduler.step()
 
-            total_loss += loss.detach()
-            for k, head_loss in losses.items():
-                head_losses[k] = head_losses.get(k, 0) + head_loss.detach()
-            self._update_metrics(y_pred, y)
-            n_batches += 1
+                total_loss += loss.detach()
+                for k, head_loss in losses.items():
+                    head_losses[k] = head_losses.get(k, 0) + head_loss.detach()
+                self._update_metrics(y_pred, y)
+                n_batches += 1
+                if self._bars_on() and n_batches % self._postfix_every == 0:
+                    bar.set_postfix(loss=f'{total_loss.item() / n_batches:.4f}')
         if n_batches == 0:
             raise ValueError('the dataloader yielded no batches')
 
@@ -482,7 +581,7 @@ class Trainer:
         if dataLoader is None:
             dataLoader = self.valid_dataloader
         self.model.eval()
-        return self._run_epoch(dataLoader, training=False)
+        return self._run_epoch(dataLoader, training=False, desc='valid')
 
     def _get_task(self, out_shape, num_classes=None):
         # the task follows from the model's output, not the class count: one logit per sample is binary
@@ -544,6 +643,8 @@ class Trainer:
             self.lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr = max_lr, pct_start=pct_start,
                                   anneal_strategy=anneal_strategy, epochs=n_epochs, steps_per_epoch=steps_per_epoch)
             self._step_per_batch = True
+            if self.verbose:
+                print(f'Scheduler: OneCycleLR for this run, max lr {max_lr:g}, stepped every batch')
             self.train(n_epochs, early_stopping, patience, loss_weights=loss_weights)
 
     @contextlib.contextmanager
@@ -616,49 +717,60 @@ class Trainer:
                     warnings.warn('loss_weights is ignored: the model returns a single output.')
                 else:
                     self._check_loss_config()
-        best_value = None
+        best_value = best_epoch = None
         patience_counter = 0
-        for epoch in range(n_epochs):
-            self.model.train()
-            t0 = time.time()
-            train_results = self._run_epoch(self.train_dataloader, training=True)
-            self._synchronize()
-            t1 = time.time()
-            valid_results = self._evaluate()
-            for split, results in (('train', train_results), ('valid', valid_results)):
-                for k, v in results.items():
-                    self.history.setdefault(f'{split}_{k}', []).append(v)
-            self.history.setdefault('learning_rate', []).append(
-                self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler else self.optimizer.param_groups[0]['lr'])
+        # the epochs bar stays when done (e.g. 7/20 after early stopping); the batch bars are removed
+        with self._bar(total=n_epochs, desc='training', unit='epoch') as epochs_bar:
+            for epoch in range(n_epochs):
+                self.model.train()
+                t0 = time.time()
+                train_results = self._run_epoch(self.train_dataloader, training=True,
+                                                desc=f'epoch {epoch + 1}')
+                self._synchronize()
+                t1 = time.time()
+                valid_results = self._evaluate()
+                t2 = time.time()   # the metrics' .item() calls in _evaluate have already synchronized
+                for split, results in (('train', train_results), ('valid', valid_results)):
+                    for k, v in results.items():
+                        self.history.setdefault(f'{split}_{k}', []).append(v)
+                self.history.setdefault('learning_rate', []).append(
+                    self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler else self.optimizer.param_groups[0]['lr'])
 
-            value = valid_results[self._monitor_key]
-            improved = (best_value is None
-                        or (value > best_value if self.higher_is_better else value < best_value))
-            if improved:
-                best_value = value
-                patience_counter  = 0
-                if self.checkpoint_path is not None:
-                    torch.save(self.model.state_dict(), self.checkpoint_path)
-            else:
-                patience_counter += 1
+                value = valid_results[self._monitor_key]
+                improved = (best_value is None
+                            or (value > best_value if self.higher_is_better else value < best_value))
+                if improved:
+                    best_value, best_epoch = value, epoch + 1
+                    patience_counter  = 0
+                    if self.checkpoint_path is not None:
+                        torch.save(self.model.state_dict(), self.checkpoint_path)
+                else:
+                    patience_counter += 1
 
-            # per-output losses are in self.history; the printout shows the total loss and the metrics
-            parts = [f'{split} {k.replace("/", " ")}: {v:.4f}' + (' (best)' if improved and split == 'valid'
-                                                                    and k == self._monitor_key else '')
-                     for split, results in (('train', train_results), ('valid', valid_results))
-                     for k, v in results.items() if not k.startswith('loss/')]
-            print(f'{epoch + 1}/{n_epochs}:  ' + ' | '.join(parts),
-                  f'| in {t1 - t0:.1f}s{" (incl. compile)" if self._needs_warmup else ""}',
-                  f'| lr: {self.history["learning_rate"][-1]:.8f}')
+                # per-output losses are in self.history; the printout shows the total loss and the metrics
+                parts = [f'{split} {k.replace("/", " ")}: {v:.4f}' + (' (best)' if improved and split == 'valid'
+                                                                        and k == self._monitor_key else '')
+                         for split, results in (('train', train_results), ('valid', valid_results))
+                         for k, v in results.items() if not k.startswith('loss/')]
+                if self.verbose:
+                    self._print(f'{epoch + 1}/{n_epochs}:  ' + ' | '.join(parts)
+                                + f' | in {t1 - t0:.1f}s{" (incl. compile)" if self._needs_warmup else ""}'
+                                + f' + {t2 - t1:.1f}s valid | lr: {self.history["learning_rate"][-1]:.8f}')
+                epochs_bar.update()
+                epochs_bar.set_postfix({f'best valid {self._monitor_key.replace("/", " ")}': f'{best_value:.4f}'})
 
-            self._needs_warmup = False
+                self._needs_warmup = False
 
-            if early_stopping and (patience_counter >= patience):
-                print("Early Stopping!")
-                break
+                if early_stopping and (patience_counter >= patience):
+                    if self.verbose:
+                        self._print(f'Early stopping: no improvement for {patience} epoch{"s" if patience != 1 else ""}')
+                    break
 
-            if self.lr_scheduler is not None and not self._step_per_batch:
-                self.lr_scheduler.step()
+                if self.lr_scheduler is not None and not self._step_per_batch:
+                    self.lr_scheduler.step()
         if self.checkpoint_path is not None and best_value is not None:
             self.model.load_state_dict(torch.load(self.checkpoint_path, map_location=self.device, weights_only=True))
+            if self.verbose:
+                print(f'Restored the best weights, from epoch {best_epoch} '
+                      f'(valid {self._monitor_key.replace("/", " ")}: {best_value:.4f})')
         #return self.history
