@@ -13,7 +13,7 @@
 import torch
 import torch.nn as nn
 import torchmetrics
-import time, secrets, warnings, contextlib, reprlib, copy
+import time, math, secrets, warnings, contextlib, reprlib, copy
 from collections.abc import Mapping
 try:
     from tqdm.auto import tqdm   # widget bars in Jupyter, text bars in a terminal
@@ -71,6 +71,7 @@ class Trainer:
             monitor=None,
             verbose=True,
             progress=True,
+            grad_clip=None,
             ):
         """Training loop with mixed precision, checkpointing, early stopping and lr scheduling.
 
@@ -109,9 +110,17 @@ class Trainer:
             checkpoint was restored. Warnings are shown either way. Can be changed later via .verbose.
         progress: show tqdm progress bars, one over the epochs and one for each epoch's batches
             (off when verbose=False or tqdm isn't installed). Can be changed later via .progress.
+        grad_clip: max norm for gradient clipping. After every backward pass, if the total L2 norm of
+            all the gradients exceeds grad_clip, they are all scaled down to that norm (the direction
+            is kept); below it they are left alone. None, 0 or False (default): off. float('inf')
+            never clips but still records the norms, to help choose a value. While it is on, the
+            mean pre-clip norm and the fraction of clipped steps are recorded per epoch in
+            history['train_grad_norm'] and history['train_clipped']. Can be changed later through
+            train(grad_clip=...).
         """
         self.verbose = verbose
         self.progress = progress
+        self._set_grad_clip(grad_clip)
         self.channels_last = channels_last
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
@@ -230,6 +239,7 @@ class Trainer:
                 'optimizer': f'{type(self.optimizer).__name__}{optimizer_note}, lr {group["lr"]:g}'
                              + (f', weight decay {group["weight_decay"]:g}' if group.get('weight_decay') else ''),
                 'scheduler': f'{type(lr_scheduler).__name__}, stepped every epoch' if lr_scheduler else 'none',
+                'grad clip': self._describe_grad_clip(),
                 'amp': amp_note,
                 'compile': f'on ({compile if isinstance(compile, str) else "default mode"})' if compile else None,
                 'channels_last': 'on' if channels_last else None,
@@ -530,6 +540,20 @@ class Trainer:
         # tqdm.write prints above the progress bars instead of breaking them
         (tqdm.write if tqdm is not None else print)(msg)
 
+    def _set_grad_clip(self, grad_clip):
+        # 0 and False mean off, like None; True is rejected rather than read as a max norm of 1
+        if grad_clip is True or (grad_clip is not None and grad_clip < 0):
+            raise ValueError('grad_clip is the max gradient norm: a positive number, '
+                             'or None/0/False to turn clipping off')
+        self.grad_clip = grad_clip or None
+
+    def _describe_grad_clip(self):
+        if self.grad_clip is None:
+            return None
+        if math.isinf(self.grad_clip):
+            return 'measure only (max norm inf): grad norms are recorded, nothing is clipped'
+        return f'max norm {self.grad_clip:g}'
+
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
 
@@ -543,6 +567,13 @@ class Trainer:
         total_loss = torch.zeros((), device=self.device)
         head_losses = {}
         n_batches = 0
+        clipping = training and self.grad_clip is not None
+        if clipping:
+            # pre-clip norm summed over the steps where it was finite (an fp16 overflow gives inf,
+            # and GradScaler skips that step), and the number of steps that were clipped
+            grad_norm_sum = torch.zeros((), device=self.device)
+            n_finite = torch.zeros((), device=self.device)
+            n_clipped = torch.zeros((), device=self.device)
         with self._bar(dataLoader, desc=desc, unit='batch', leave=False) as bar:
             for batch in bar:
                 X, y = self._to_device(batch)
@@ -554,6 +585,15 @@ class Trainer:
                 if training:
                     # scaler is a no-op unless training in fp16
                     self.scaler.scale(loss).backward()
+                    if clipping:
+                        # clip the real gradients, not the fp16-scaled ones; a no-op when the scaler is off
+                        self.scaler.unscale_(self.optimizer)
+                        norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        norm = norm.to(self.device)
+                        finite = norm.isfinite()
+                        grad_norm_sum += torch.where(finite, norm, 0)
+                        n_finite += finite
+                        n_clipped += finite & (norm > self.grad_clip)
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                     self.optimizer.zero_grad()
@@ -574,6 +614,9 @@ class Trainer:
         results = {'loss': total_loss.item() / n_batches}
         results.update({f'loss/{k}': head_loss.item() / n_batches for k, head_loss in head_losses.items()})
         results.update(self._compute_metrics())
+        if clipping:
+            results['grad_norm'] = (grad_norm_sum / n_finite).item() if n_finite.item() else float('nan')
+            results['clipped'] = n_clipped.item() / n_batches
         return results
 
     @torch.inference_mode()
@@ -630,10 +673,11 @@ class Trainer:
             pct_start = 0.3,
             anneal_strategy='cos',
             loss_weights=None,
+            grad_clip=None,
             ):
         """Train with a one-cycle lr schedule; the optimizer's lr and momentum settings are restored afterwards.
 
-        n_epochs, early_stopping, patience, loss_weights: as for train().
+        n_epochs, early_stopping, patience, loss_weights, grad_clip: as for train().
         max_lr: peak learning rate.
         pct_start: fraction of the steps spent increasing the learning rate.
         anneal_strategy: 'cos' or 'linear'.
@@ -645,7 +689,7 @@ class Trainer:
             self._step_per_batch = True
             if self.verbose:
                 print(f'Scheduler: OneCycleLR for this run, max lr {max_lr:g}, stepped every batch')
-            self.train(n_epochs, early_stopping, patience, loss_weights=loss_weights)
+            self.train(n_epochs, early_stopping, patience, loss_weights=loss_weights, grad_clip=grad_clip)
 
     @contextlib.contextmanager
     def _temporary_lr_schedule(self):
@@ -693,7 +737,7 @@ class Trainer:
                           f'{reshaped} reset after a shape change')
 
 
-    def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None, loss_weights=None):
+    def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None, loss_weights=None, grad_clip=None):
         """Train the model, validating after every epoch and reloading the best checkpoint at the end.
 
         n_epochs: number of epochs.
@@ -701,8 +745,12 @@ class Trainer:
         patience: epochs without improvement before stopping.
         lr: new learning rate for this and later runs; ignored when an lr_scheduler is set.
         loss_weights: new per-output loss weights (list/dict) for this and later runs.
+        grad_clip: new max gradient norm for this and later runs (see Trainer); 0 or False turns
+            clipping off, None (default) keeps the current setting.
         """
         self.sync_optimizer()
+        if grad_clip is not None:
+            self._set_grad_clip(grad_clip)
         # lr overrides the optimizer's learning rate for this and subsequent runs; ignored when a scheduler is set
         if lr is not None:
             if self.lr_scheduler is not None:
@@ -751,7 +799,12 @@ class Trainer:
                 parts = [f'{split} {k.replace("/", " ")}: {v:.4f}' + (' (best)' if improved and split == 'valid'
                                                                         and k == self._monitor_key else '')
                          for split, results in (('train', train_results), ('valid', valid_results))
-                         for k, v in results.items() if not k.startswith('loss/')]
+                         for k, v in results.items()
+                         if not k.startswith('loss/') and k not in ('grad_norm', 'clipped')]
+                if 'grad_norm' in train_results:
+                    parts.append(f'grad norm: {train_results["grad_norm"]:.3g}'
+                                 + (f' (clipped {train_results["clipped"]:.0%})'
+                                    if not math.isinf(self.grad_clip) else ''))
                 if self.verbose:
                     self._print(f'{epoch + 1}/{n_epochs}:  ' + ' | '.join(parts)
                                 + f' | in {t1 - t0:.1f}s{" (incl. compile)" if self._needs_warmup else ""}'

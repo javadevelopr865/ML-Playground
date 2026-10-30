@@ -718,3 +718,58 @@ Benchmark (2-layer GRU, vocab 2000, 4096 sequences, batch 32, NAdam, mps, warm-u
 The criterion/metric printout in aae893e added a second _describe() method, which replaced
 the existing _describe(obj) used by the batch-format error messages. The new one is now
 _describe_spec().
+
+
+======================================================================
+PART 5. GRADIENT CLIPPING: grad_clip (2026-10-30)
+======================================================================
+
+Status: APPLIED 2026-10-30.
+Tested on cpu and mps (fp32, and fp16 with GradScaler) with a small synthetic MLP.
+
+
+1. What it does
+---------------
+Clipping by norm (torch.nn.utils.clip_grad_norm_). After every backward pass the gradients
+of all the parameters are treated as one vector; if its L2 norm is above grad_clip, every
+gradient is scaled by grad_clip / norm. The direction of the update is kept, only its length
+is capped. Below the threshold nothing changes.
+Whether it only catches "explosions" depends on the threshold: well above the typical norm it
+is a safety net for rare spikes; at a low value (1.0 is common for RNNs/transformers) it may
+clip most steps, which caps the step size all the time. Clipping by value is not offered.
+
+2. Where to set it
+------------------
+  - Trainer(..., grad_clip=None): the max norm. None, 0 or False: off (the default).
+    True or a negative number raises a ValueError.
+  - train(grad_clip=...) and train_one_cycle(grad_clip=...): change it for this and later
+    runs, like lr and loss_weights. 0 or False turns it off; None keeps the current setting.
+  - grad_clip=float('inf'): measure only -- never clips, but records the norms. Run an
+    epoch or two like this to see the typical norm before choosing a threshold.
+  - New Trainer argument added at the end of the signature, so positional calls still work.
+
+3. The training step
+--------------------
+    scaler.scale(loss).backward()
+    scaler.unscale_(optimizer)          # only when clipping is on
+    clip_grad_norm_(model.parameters(), grad_clip)
+    scaler.step(optimizer)
+
+  - unscale_ matters with fp16: GradScaler multiplies the gradients by a large factor (65536
+    at first), and clipping those would clip nearly every step by the wrong amount. It does
+    nothing when the scaler is off (bf16, fp32, cpu), so there is no separate branch.
+  - An fp16 overflow gives an inf norm; GradScaler skips that step as before. Those steps
+    are left out of the recorded norm and clipped counts (on mps the first epoch showed
+    "clipped 75%" for this reason: the rest were overflow steps while the scale settled).
+  - self.model.parameters() is used, which a compiled model shares.
+
+4. Monitoring
+-------------
+While clipping is on (including the inf mode):
+  - history['train_grad_norm']: mean pre-clip norm per epoch (over the finite steps).
+  - history['train_clipped']: fraction of the epoch's steps that were clipped.
+  - The epoch line gets "| grad norm: 39.5 (clipped 100%)" ("clipped" is left out in
+    measure-only mode).
+  - The setup summary gets a "grad clip:" line (only when on).
+  - The sums stay on the device and are read once per epoch, so no per-batch sync is added.
+  - When off, the step is unchanged apart from one bool check.
