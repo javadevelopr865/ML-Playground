@@ -72,6 +72,7 @@ class Trainer:
             verbose=True,
             progress=True,
             grad_clip=None,
+            reset_state=None,
             ):
         """Training loop with mixed precision, checkpointing, early stopping and lr scheduling.
 
@@ -117,10 +118,25 @@ class Trainer:
             mean pre-clip norm and the fraction of clipped steps are recorded per epoch in
             history['train_grad_norm'] and history['train_clipped']. Can be changed later through
             train(grad_clip=...).
+        reset_state: for stateful models that carry a hidden state from one batch to the next (e.g. an
+            RNN/LSTM trained with truncated backprop through time). True calls model.reset(); a callable
+            is called as reset_state(model). It runs at the start of every pass over a dataloader (each
+            training epoch, each validation, evaluate()) and around the forward passes the Trainer makes
+            to inspect the model's output, so no state leaks between training and validation. None or
+            False (default): never. Not needed for models that start from a fresh hidden state on every
+            call (nn.LSTM called without a hidden state), which already work as they are.
+            The model itself must still:
+              - detach the state between batches (self.h = h.detach()), otherwise the second batch fails
+                with "Trying to backward through the graph a second time";
+              - keep the state in a plain attribute, not a registered buffer, so it stays out of the
+                state_dict and the checkpoints;
+              - handle a smaller last batch, e.g. reset when x.size(0) changes, or use drop_last=True.
+            With compile=True, changing Python attributes inside forward can cause graph breaks/recompiles.
         """
         self.verbose = verbose
         self.progress = progress
         self._set_grad_clip(grad_clip)
+        self._set_reset_state(reset_state, model)
         self.channels_last = channels_last
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
@@ -240,6 +256,7 @@ class Trainer:
                              + (f', weight decay {group["weight_decay"]:g}' if group.get('weight_decay') else ''),
                 'scheduler': f'{type(lr_scheduler).__name__}, stepped every epoch' if lr_scheduler else 'none',
                 'grad clip': self._describe_grad_clip(),
+                'reset state': self._describe_reset_state(),
                 'amp': amp_note,
                 'compile': f'on ({compile if isinstance(compile, str) else "default mode"})' if compile else None,
                 'channels_last': 'on' if channels_last else None,
@@ -335,15 +352,20 @@ class Trainer:
     def _probe(self, train_mode=False):
         # one forward pass on a training batch, without gradients or batchnorm updates; train_mode=True
         # shows outputs some models return only while training (e.g. auxiliary classifiers)
+        # a stateful model is reset before and after, so the probe neither uses nor leaves a hidden state
         sample_x, _ = self._sample(self.train_dataloader)
         was_training = self.model.training
         saved_buffers = {n: b.clone() for n, b in self.model.named_buffers()}
         self.model.train(train_mode)
-        with torch.no_grad():
-            y_pred = self._forward(sample_x, self.model)
-            for n, b in self.model.named_buffers():
-                b.copy_(saved_buffers[n])
-        self.model.train(was_training)
+        try:
+            self._reset_model_state()
+            with torch.no_grad():
+                y_pred = self._forward(sample_x, self.model)
+                for n, b in self.model.named_buffers():
+                    b.copy_(saved_buffers[n])
+        finally:
+            self._reset_model_state()
+            self.model.train(was_training)
         return y_pred
 
     @staticmethod
@@ -554,12 +576,41 @@ class Trainer:
             return 'measure only (max norm inf): grad norms are recorded, nothing is clipped'
         return f'max norm {self.grad_clip:g}'
 
+    def _set_reset_state(self, reset_state, model):
+        # True means model.reset(); a callable is called with the model; None/False means off
+        if reset_state is None or reset_state is False:
+            self._reset_fn = None
+        elif reset_state is True:
+            if not callable(getattr(model, 'reset', None)):
+                raise ValueError(f'reset_state=True calls model.reset(), but {type(model).__name__} has no '
+                                 'reset() method: add one, or pass a callable, reset_state=lambda m: ...')
+            self._reset_fn = lambda m: m.reset()
+        elif callable(reset_state):
+            self._reset_fn = reset_state
+        else:
+            raise TypeError(f'reset_state must be None, False, True or a callable, got {self._describe(reset_state)}')
+        self._reset_desc = (None if self._reset_fn is None else 'model.reset()' if reset_state is True
+                            else getattr(reset_state, '__name__', type(reset_state).__name__))
+
+    def _describe_reset_state(self):
+        if self._reset_fn is None:
+            return None
+        return f'{self._reset_desc}, at the start of every training epoch and validation'
+
+    def _reset_model_state(self):
+        # called on self.model, which a compiled self._fwd shares
+        if self._reset_fn is not None:
+            self._reset_fn(self.model)
+
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
 
     def _run_epoch(self, dataLoader, training, desc=None):
         # one pass over dataLoader (with optimizer steps when training); returns the mean loss per batch,
         # per-output losses and metrics, e.g. {'loss': ..., 'loss/aux': ..., 'metric/aux': ...}
+        # a stateful model starts every pass fresh: a state left by validation was made under
+        # inference_mode and can't be used for backward, and one left by training would leak into validation
+        self._reset_model_state()
         if self._outputs_ready:
             for m in self._metrics.values():
                 m.reset()

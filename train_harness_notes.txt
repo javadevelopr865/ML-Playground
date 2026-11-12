@@ -9,6 +9,8 @@ supersede earlier ones where they disagree; those places are marked.
   PART 3. Task inference, checkpointing, batches, multiple inputs/outputs,
           device placement (2026-10-28)
   PART 4. Setup summary, verbose, progress bars, speed check (2026-10-30)
+  PART 5. Gradient clipping: grad_clip (2026-10-30)
+  PART 6. Stateful RNNs/LSTMs: reset_state (2026-11-12)
 
 (Parts 2 and 3 were train_harness_sync_optimizer.txt and
 train_harness_batches_and_task_inference.txt.)
@@ -773,3 +775,83 @@ While clipping is on (including the inf mode):
   - The setup summary gets a "grad clip:" line (only when on).
   - The sums stay on the device and are read once per epoch, so no per-batch sync is added.
   - When off, the step is unchanged apart from one bool check.
+
+
+======================================================================
+PART 6. STATEFUL RNNs/LSTMs: reset_state (2026-11-12)
+======================================================================
+
+Status: APPLIED 2026-11-12.
+Tested on cpu and mps in ~/.venv (torch 2.14.0) with a small stateful LSTM language model
+(next-token prediction, sequential non-shuffled chunks), plus a stateless MLP regression check.
+
+
+1. When it is needed
+--------------------
+Only for stateful models: ones that keep a hidden state (self.h) from one batch to the
+next, e.g. truncated backprop through time over a long text cut into consecutive chunks.
+Models that start from a fresh state on every call (nn.LSTM called without a hidden state:
+sequence classification, most seq2seq) already work and need nothing.
+
+2. Where to set it
+------------------
+  - Trainer(..., reset_state=None): True calls model.reset(); a callable is called as
+    reset_state(model) (for other method names, or an RNN inside a submodule).
+    None/False: off (the default).
+  - True on a model with no reset() method raises a ValueError; anything that isn't
+    None/False/True/a callable raises a TypeError.
+  - Automatic detection of model.reset was left out on purpose: reset() is not a standard
+    nn.Module method, so it could call something unrelated.
+  - Named reset_state rather than reset, which the class already uses for the metrics.
+  - New Trainer argument added at the end of the signature, so positional calls still work.
+  - It is called on self.model, which a compiled self._fwd shares.
+
+3. When it runs
+---------------
+  - At the start of every pass in _run_epoch: each training epoch, each validation and
+    evaluate(). This one place covers both "after every epoch" and "before validation".
+  - Before and after the probe forward pass in _probe() (used in __init__ to infer the
+    criterion/metric and by evaluate() before training), so the probe neither starts from
+    a stale state nor leaves its own behind.
+  - The setup summary gets a "reset state:" line (only when on).
+
+Why the reset before each training epoch is required: _evaluate runs under
+torch.inference_mode(), so a state saved during validation is an inference tensor. If the
+next training epoch starts from it, backward fails with
+  "Inference tensors cannot be saved for backward".
+The test reproduced exactly this without reset_state (with drop_last=True on the valid
+loader), and it trained normally with it. Resetting before validation also keeps the
+training state from leaking into the validation numbers.
+
+4. What the model still has to do
+---------------------------------
+  - Detach the state between batches: self.h = tuple(t.detach() for t in h). Otherwise
+    the second batch fails with "Trying to backward through the graph a second time".
+    The Trainer can't do this, since it doesn't know where the state lives.
+  - Keep the state in a plain attribute, not a registered buffer: a buffer goes into the
+    state_dict (and so the checkpoints), load_state_dict fails when the batch size differs,
+    and _probe would copy it back.
+  - Handle a smaller last batch: reset when x.size(0) differs from the state's batch size,
+    or use drop_last=True.
+  - With compile=True, changing Python attributes in forward can cause graph breaks or
+    recompiles.
+
+Example:
+    class StatefulLM(nn.Module):
+        def reset(self): self.h = None
+        def forward(self, x):
+            if self.h is not None and self.h[0].size(1) != x.size(0):
+                self.h = None
+            o, h = self.rnn(self.emb(x), self.h)
+            self.h = tuple(t.detach() for t in h)
+            return self.out(o).permute(0, 2, 1)    # (B, C, T)
+
+    Trainer(StatefulLM(), train_dl, valid_dl, reset_state=True)
+
+5. Per-timestep outputs (no code change)
+----------------------------------------
+For one prediction per timestep, return (B, C, T) with (B, T) targets, as in the
+example. _get_task reads dim 1 as the class count, and CrossEntropyLoss and torchmetrics'
+multiclass Accuracy both take (N, C, d1, ...), so the default loss, metric and task
+inference work as they are. A (B, T, C) output would be read as a T-class problem.
+
