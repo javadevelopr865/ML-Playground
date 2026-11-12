@@ -13,7 +13,7 @@
 import torch
 import torch.nn as nn
 import torchmetrics
-import time, math, secrets, warnings, contextlib, reprlib, copy
+import time, math, numbers, secrets, warnings, contextlib, reprlib, copy
 from collections.abc import Mapping
 try:
     from tqdm.auto import tqdm   # widget bars in Jupyter, text bars in a terminal
@@ -73,6 +73,8 @@ class Trainer:
             progress=True,
             grad_clip=None,
             reset_state=None,
+            ar=0.0,
+            tar=0.0,
             ):
         """Training loop with mixed precision, checkpointing, early stopping and lr scheduling.
 
@@ -132,11 +134,24 @@ class Trainer:
                 state_dict and the checkpoints;
               - handle a smaller last batch, e.g. reset when x.size(0) changes, or use drop_last=True.
             With compile=True, changing Python attributes inside forward can cause graph breaks/recompiles.
+        ar, tar: activation regularization and temporal activation regularization (AWD-LSTM), for RNNs.
+            On every training batch the model must set, in forward, self.dropped_out (the RNN output
+            after dropout) when ar > 0 and self.raw_out (before dropout) when tar > 0, each a
+            (B, T, H) tensor (batch first) or a list of them, e.g. one per layer. Then
+                ar  * mean(dropped_out ** 2)                                  (summed over the list)
+                tar * mean((raw_out[:, 1:] - raw_out[:, :-1]) ** 2)
+            are added to the loss that is backpropagated. They are computed in float32, during
+            training only, and are not included in the reported train loss, which stays comparable
+            with the valid loss; the penalties are recorded per epoch in history['train_ar'] and
+            history['train_tar']. The Trainer clears both attributes before and after every training
+            forward pass, and a missing one raises an error. Typical values: ar=2, tar=1.
+            0 (default): off. Can be changed later through train(ar=..., tar=...).
         """
         self.verbose = verbose
         self.progress = progress
         self._set_grad_clip(grad_clip)
         self._set_reset_state(reset_state, model)
+        self._set_activation_reg(0.0 if ar is None else ar, 0.0 if tar is None else tar)
         self.channels_last = channels_last
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
@@ -257,6 +272,7 @@ class Trainer:
                 'scheduler': f'{type(lr_scheduler).__name__}, stepped every epoch' if lr_scheduler else 'none',
                 'grad clip': self._describe_grad_clip(),
                 'reset state': self._describe_reset_state(),
+                'activation reg': self._describe_activation_reg(),
                 'amp': amp_note,
                 'compile': f'on ({compile if isinstance(compile, str) else "default mode"})' if compile else None,
                 'channels_last': 'on' if channels_last else None,
@@ -602,6 +618,57 @@ class Trainer:
         if self._reset_fn is not None:
             self._reset_fn(self.model)
 
+    _ACT_ATTRS = ('raw_out', 'dropped_out')
+
+    def _set_activation_reg(self, ar=None, tar=None):
+        # None keeps the current value; 0/False turns that penalty off
+        for name, value in (('ar', ar), ('tar', tar)):
+            if value is None:
+                continue
+            if value is True or not isinstance(value, numbers.Real) or not value >= 0 or math.isinf(value):
+                raise ValueError(f'{name} is a penalty coefficient: a finite number >= 0 (0 or False: off), '
+                                 f'got {value!r}')
+            setattr(self, name, float(value))
+
+    def _describe_activation_reg(self):
+        parts = [f'{name} {coef:g} on model.{attr}' for name, coef, attr in
+                 (('ar', self.ar, 'dropped_out'), ('tar', self.tar, 'raw_out')) if coef]
+        return ', '.join(parts) or None
+
+    def _clear_activations(self):
+        # so a tensor from an earlier batch (or the probe/validation) is never used, and none is kept alive
+        for attr in self._ACT_ATTRS:
+            if getattr(self.model, attr, None) is not None:
+                setattr(self.model, attr, None)
+
+    def _get_activations(self, attr, coef_name):
+        acts = getattr(self.model, attr, None)
+        if acts is None:
+            raise ValueError(f'{coef_name} > 0 but the model did not set self.{attr} in forward on this training '
+                             f'batch: set it to the RNN output {"before" if attr == "raw_out" else "after"} '
+                             f'dropout, a (B, T, H) tensor or a list of them, or set {coef_name}=0')
+        acts = list(acts) if isinstance(acts, (list, tuple)) else [acts]
+        if not all(torch.is_tensor(a) for a in acts):
+            raise TypeError(f'model.{attr} must be a tensor or a list/tuple of tensors, got {self._describe(acts)}')
+        return acts
+
+    def _activation_reg(self, ref):
+        # the (weighted) AR and TAR penalties for the activations the model set in this forward pass,
+        # in float32 on ref's device; a penalty that is off is None
+        ar_loss = tar_loss = None
+        if self.ar:
+            ar_loss = self.ar * sum(self._align(a.float().pow(2).mean(), ref)
+                                    for a in self._get_activations('dropped_out', 'ar'))
+        if self.tar:
+            terms = []
+            for a in self._get_activations('raw_out', 'tar'):
+                if a.dim() < 2:
+                    raise ValueError(f'tar needs model.raw_out shaped (B, T, ...), got shape {tuple(a.shape)}')
+                if a.size(1) > 1:   # a single time step has no differences
+                    terms.append(self._align((a[:, 1:] - a[:, :-1]).float().pow(2).mean(), ref))
+            tar_loss = self.tar * sum(terms) if terms else torch.zeros((), device=ref.device)
+        return ar_loss, tar_loss
+
     def _autocast(self):
         return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_enabled)
 
@@ -619,6 +686,10 @@ class Trainer:
         head_losses = {}
         n_batches = 0
         clipping = training and self.grad_clip is not None
+        act_reg = training and bool(self.ar or self.tar)
+        if act_reg:
+            ar_sum = torch.zeros((), device=self.device)
+            tar_sum = torch.zeros((), device=self.device)
         if clipping:
             # pre-clip norm summed over the steps where it was finite (an fp16 overflow gives inf,
             # and GradScaler skips that step), and the number of steps that were clipped
@@ -628,14 +699,27 @@ class Trainer:
         with self._bar(dataLoader, desc=desc, unit='batch', leave=False) as bar:
             for batch in bar:
                 X, y = self._to_device(batch)
+                if act_reg:
+                    self._clear_activations()
                 with self._autocast():
                     y_pred = self._forward(X)
                     if not self._outputs_ready:
                         self._setup_outputs(y_pred)
                     loss, losses = self._compute_loss(y_pred, y)
+                backward_loss = loss
+                if act_reg:
+                    # added to the loss that is backpropagated, not to the reported one
+                    ar_loss, tar_loss = self._activation_reg(loss)
+                    self._clear_activations()
+                    if ar_loss is not None:
+                        backward_loss = backward_loss + ar_loss
+                        ar_sum += ar_loss.detach().to(self.device)
+                    if tar_loss is not None:
+                        backward_loss = backward_loss + tar_loss
+                        tar_sum += tar_loss.detach().to(self.device)
                 if training:
                     # scaler is a no-op unless training in fp16
-                    self.scaler.scale(loss).backward()
+                    self.scaler.scale(backward_loss).backward()
                     if clipping:
                         # clip the real gradients, not the fp16-scaled ones; a no-op when the scaler is off
                         self.scaler.unscale_(self.optimizer)
@@ -668,6 +752,11 @@ class Trainer:
         if clipping:
             results['grad_norm'] = (grad_norm_sum / n_finite).item() if n_finite.item() else float('nan')
             results['clipped'] = n_clipped.item() / n_batches
+        if act_reg:
+            if self.ar:
+                results['ar'] = ar_sum.item() / n_batches
+            if self.tar:
+                results['tar'] = tar_sum.item() / n_batches
         return results
 
     @torch.inference_mode()
@@ -725,10 +814,12 @@ class Trainer:
             anneal_strategy='cos',
             loss_weights=None,
             grad_clip=None,
+            ar=None,
+            tar=None,
             ):
         """Train with a one-cycle lr schedule; the optimizer's lr and momentum settings are restored afterwards.
 
-        n_epochs, early_stopping, patience, loss_weights, grad_clip: as for train().
+        n_epochs, early_stopping, patience, loss_weights, grad_clip, ar, tar: as for train().
         max_lr: peak learning rate.
         pct_start: fraction of the steps spent increasing the learning rate.
         anneal_strategy: 'cos' or 'linear'.
@@ -740,7 +831,8 @@ class Trainer:
             self._step_per_batch = True
             if self.verbose:
                 print(f'Scheduler: OneCycleLR for this run, max lr {max_lr:g}, stepped every batch')
-            self.train(n_epochs, early_stopping, patience, loss_weights=loss_weights, grad_clip=grad_clip)
+            self.train(n_epochs, early_stopping, patience, loss_weights=loss_weights, grad_clip=grad_clip,
+                       ar=ar, tar=tar)
 
     @contextlib.contextmanager
     def _temporary_lr_schedule(self):
@@ -788,7 +880,8 @@ class Trainer:
                           f'{reshaped} reset after a shape change')
 
 
-    def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None, loss_weights=None, grad_clip=None):
+    def train(self,n_epochs=5, early_stopping=False, patience = 10, lr=None, loss_weights=None, grad_clip=None,
+              ar=None, tar=None):
         """Train the model, validating after every epoch and reloading the best checkpoint at the end.
 
         n_epochs: number of epochs.
@@ -798,10 +891,13 @@ class Trainer:
         loss_weights: new per-output loss weights (list/dict) for this and later runs.
         grad_clip: new max gradient norm for this and later runs (see Trainer); 0 or False turns
             clipping off, None (default) keeps the current setting.
+        ar, tar: new activation regularization coefficients for this and later runs (see Trainer);
+            0 turns that penalty off, None (default) keeps the current setting.
         """
         self.sync_optimizer()
         if grad_clip is not None:
             self._set_grad_clip(grad_clip)
+        self._set_activation_reg(ar, tar)
         # lr overrides the optimizer's learning rate for this and subsequent runs; ignored when a scheduler is set
         if lr is not None:
             if self.lr_scheduler is not None:

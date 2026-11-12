@@ -11,6 +11,7 @@ supersede earlier ones where they disagree; those places are marked.
   PART 4. Setup summary, verbose, progress bars, speed check (2026-10-30)
   PART 5. Gradient clipping: grad_clip (2026-10-30)
   PART 6. Stateful RNNs/LSTMs: reset_state (2026-11-12)
+  PART 7. Activation regularization: ar, tar (2026-11-12)
 
 (Parts 2 and 3 were train_harness_sync_optimizer.txt and
 train_harness_batches_and_task_inference.txt.)
@@ -854,4 +855,87 @@ For one prediction per timestep, return (B, C, T) with (B, T) targets, as in the
 example. _get_task reads dim 1 as the class count, and CrossEntropyLoss and torchmetrics'
 multiclass Accuracy both take (N, C, d1, ...), so the default loss, metric and task
 inference work as they are. A (B, T, C) output would be read as a T-class problem.
+
+
+======================================================================
+PART 7. ACTIVATION REGULARIZATION: ar, tar (2026-11-12)
+======================================================================
+
+Status: APPLIED 2026-11-12.
+Tested on cpu and mps (fp16 autocast with GradScaler) and with compile=True on cpu, in
+~/.venv (torch 2.14.0), with a small stateful LSTM language model with dropout.
+
+
+1. What it does
+---------------
+The two RNN regularizers from AWD-LSTM (Merity et al.), as in fastai's RNNRegularizer:
+  AR  = ar  * mean(dropped_out ** 2)                           # output AFTER dropout
+  TAR = tar * mean((raw_out[:, 1:] - raw_out[:, :-1]) ** 2)    # output BEFORE dropout
+AR keeps the activations small; TAR penalises large changes between consecutive time
+steps. Both are added to the loss that is backpropagated on each training batch.
+Typical values: ar=2, tar=1.
+
+2. Where to set it
+------------------
+  - Trainer(..., ar=0.0, tar=0.0): 0, False or None means off (the default).
+    True, a negative number, inf or a non-number raises a ValueError.
+  - train(ar=..., tar=...) and train_one_cycle(ar=..., tar=...): change them for this and
+    later runs; 0 turns that penalty off, None keeps the current value.
+  - New Trainer arguments added at the end of the signature, so positional calls still work.
+  - The setup summary gets an "activation reg:" line (only when on).
+
+3. How the model hands over the activations
+-------------------------------------------
+In forward, the model sets attributes on itself:
+    self.raw_out     = raw        # needed when tar > 0
+    self.dropped_out = dropped    # needed when ar > 0
+Each is a (B, T, H) tensor (batch first), or a list/tuple of them (e.g. one per LSTM
+layer), in which case the per-tensor penalties are summed. The paper applies them to the
+last layer only; that is the model's choice.
+
+Why attributes rather than extra return values: anything the model returns as a
+tuple/dict is treated as separate outputs, each needing its own criterion and metric (or a
+loss weight of 0), and multi-output models lose the default loss and metric. Attributes
+leave the output alone, so task inference, metrics and evaluate() work as before. Same
+convention as model.reset() for reset_state (PART 6).
+
+  - The Trainer clears both attributes before and after every training forward pass, so a
+    tensor from an earlier batch, the probe or validation is never used, and none is kept
+    alive after the step.
+  - If a needed attribute is missing (None) after a training forward pass, a ValueError
+    names it, rather than the penalty silently doing nothing.
+  - With compile=True, setting the attributes inside the compiled forward works (tested).
+
+4. Details
+----------
+  - Training only: not computed during validation or evaluate().
+  - Not part of the reported loss: history['train_loss'] is still just the criterion, so it
+    stays comparable with valid_loss (checked: with lr=0 the reported train loss is the
+    same with and without the penalties). The weighted penalties, averaged over the
+    epoch's batches, go to history['train_ar'] and history['train_tar'] and the epoch line
+    ("train ar: ... | train tar: ..."). These keys are only appended while that penalty is
+    on, so after turning one off midway its list is shorter than train_loss (same as
+    train_grad_norm for grad_clip).
+  - Computed in float32 (.float()) so pow(2) can't overflow under fp16 autocast.
+  - Added before backward, so grad_clip clips the combined gradient (as in AWD-LSTM).
+  - Summed on the device and read once per epoch: no per-batch sync.
+  - A raw_out with a single time step contributes 0 to TAR (there are no differences).
+
+5. Not handled (documented gaps)
+--------------------------------
+  - Padding: with padded variable-length batches the means include the padded positions;
+    masking would need the lengths.
+  - TAR doesn't link the last step of one TBPTT batch to the first step of the next, the
+    same as the reference implementations.
+  - The time dimension is assumed to be dim 1 (batch first); there is no time_dim option.
+
+Example:
+    def forward(self, x):
+        raw, h = self.rnn(self.emb(x), self.h)
+        self.h = tuple(t.detach() for t in h)
+        dropped = self.drop(raw)
+        self.raw_out, self.dropped_out = raw, dropped
+        return self.out(dropped).permute(0, 2, 1)     # (B, C, T)
+
+    Trainer(model, train_dl, valid_dl, reset_state=True, ar=2, tar=1)
 
