@@ -12,6 +12,8 @@ supersede earlier ones where they disagree; those places are marked.
   PART 5. Gradient clipping: grad_clip (2026-10-30)
   PART 6. Stateful RNNs/LSTMs: reset_state (2026-11-12)
   PART 7. Activation regularization: ar, tar (2026-11-12)
+  PART 8. Class docstring (2026-11-14)
+  PART 9. Data as in-memory tensors: (X, y) and batch_size (2026-11-14)
 
 (Parts 2 and 3 were train_harness_sync_optimizer.txt and
 train_harness_batches_and_task_inference.txt.)
@@ -954,3 +956,55 @@ unchanged) and put a short overview in front of it: a usage example, the public 
 (train, train_one_cycle, evaluate, sync_optimizer) and where the per-epoch results are
 kept (.history). __init__ no longer has its own docstring, so the text isn't shown twice.
 Documentation only, no behavior change.
+
+
+======================================================================
+PART 9. DATA AS IN-MEMORY TENSORS: (X, y) AND batch_size (2026-11-14)
+======================================================================
+
+Before: train_dataloader / valid_dataloader had to be iterables of (inputs, targets)
+batches (a DataLoader, a list of batches, ...). Passing tensors directly failed with
+"expected each batch to be an (inputs, targets) pair", because iterating (X, y) yields
+all of X, then all of y.
+
+1. Usage
+--------
+    Trainer(model, (X_train, y_train), (X_valid, y_valid), batch_size=64)
+    trainer.evaluate((X_test, y_test))
+
+  - X and y can be tensors or numpy arrays (converted with torch.as_tensor, no copy).
+  - Either can also be a tuple/list/dict of them, as for batches: ((X1, X2), y) for a
+    model(x1, x2), ({'x': X}, y) for a dict input, (X, (y1, y2)) for several outputs.
+  - Every array must have the same length (first dimension), otherwise a ValueError
+    gives the lengths found.
+  - batch_size (new, last argument, default 32) is only used for tensor data; it is
+    ignored for dataloaders. evaluate() uses it too when given tensors.
+  - Training data is reshuffled every epoch; validation/evaluate data keeps its order.
+  - The last batch is smaller when the length isn't a multiple of batch_size (no
+    drop_last). With compile=True this still triggers the existing recompile warning,
+    which now says to make the length a multiple of batch_size or use a DataLoader.
+  - prepare_batch is still applied to each batch, and batches are moved to the device as
+    usual, so the tensors can stay on the cpu (or already be on the device).
+  - The setup summary says "N batches of B from tensors (S samples, shuffled)".
+
+2. How it works
+---------------
+  - _as_tensor_data(data) decides whether data is (X, y) arrays: a tuple/list of length 2
+    whose leaves are all tensors/numpy arrays with at least one dimension. Anything else
+    (DataLoader, list of batches, generator) is passed through unchanged, so existing
+    code behaves as before.
+  - Ambiguous case: a list of exactly two batches, [(xb, yb), (xb, yb)], has the same
+    shape as ((X1, X2), (y1, y2)). A *list* whose two items are both tuples/lists is
+    therefore taken as batches; use a *tuple* for multi-input + multi-output data.
+  - _TensorBatches wraps the tensors: len() is the number of batches, and each epoch it
+    slices whole batches (a randperm index when shuffling) instead of collating one sample
+    at a time like DataLoader(TensorDataset(...)), so it is faster for small models.
+    Checked: with shuffling off it gives exactly the same weights as the equivalent
+    DataLoader.
+
+3. Not handled
+--------------
+  - A single tensor (no targets) is still rejected with the batch-pair error.
+  - No num_workers / pin_memory / drop_last options: use a DataLoader for those.
+  - num_classes can't be read from dataset.classes; it is inferred from the model output
+    (or pass num_classes=).

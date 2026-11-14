@@ -34,6 +34,67 @@ class _NoBar:
     def update(self, n=1): pass
     def set_postfix(self, *args, **kwargs): pass
 
+def _map_arrays(fn, obj):
+    # applies fn to every tensor in a nested tuple/list/dict, keeping the structure
+    if isinstance(obj, Mapping):
+        return {k: _map_arrays(fn, v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_map_arrays(fn, v) for v in obj)
+    return fn(obj)
+
+
+def _array_leaves(obj):
+    # the leaves of a nested tuple/list/dict, or None if any leaf isn't a tensor/numpy array
+    if isinstance(obj, Mapping):
+        obj = list(obj.values())
+    if isinstance(obj, (list, tuple)):
+        leaves = []
+        for v in obj:
+            sub = _array_leaves(v)
+            if sub is None:
+                return None
+            leaves += sub
+        return leaves or None
+    if torch.is_tensor(obj) or type(obj).__module__ == 'numpy' and hasattr(obj, 'shape'):
+        return [obj]
+    return None
+
+
+def _as_tensor_data(data):
+    # (inputs, targets) of in-memory tensors/numpy arrays -> the same with tensors, or None if data isn't that.
+    # inputs/targets may each be one array or a tuple/list/dict of them, all with the same first dimension.
+    # A list whose two items are both tuples/lists is taken as a list of two batches, not as data.
+    if not (isinstance(data, (tuple, list)) and len(data) == 2) or isinstance(data, list) and all(
+            isinstance(v, (tuple, list)) for v in data):
+        return None
+    leaves = _array_leaves(data)
+    if leaves is None or any(len(getattr(a, 'shape', ())) == 0 for a in leaves):
+        return None
+    sizes = {a.shape[0] for a in leaves}
+    if len(sizes) > 1:
+        raise ValueError(f'inputs and targets given as tensors must all have the same length (first '
+                         f'dimension), got {sorted(sizes)}')
+    return _map_arrays(torch.as_tensor, data)
+
+
+class _TensorBatches:
+    # iterates over (inputs, targets) tensors in batches, like a DataLoader over a TensorDataset but slicing
+    # whole batches at once instead of collating one sample at a time
+    def __init__(self, data, batch_size, shuffle):
+        self.data, self.batch_size, self.shuffle, self.drop_last = data, batch_size, shuffle, False
+        self.n = _array_leaves(data)[0].shape[0]
+    def __len__(self):
+        return math.ceil(self.n / self.batch_size)
+    def __iter__(self):
+        order = torch.randperm(self.n) if self.shuffle else None
+        for start in range(0, self.n, self.batch_size):
+            if order is None:
+                yield _map_arrays(lambda t: t[start:start + self.batch_size], self.data)
+            else:
+                idx = order[start:start + self.batch_size]
+                yield _map_arrays(lambda t: t[idx.to(t.device)], self.data)
+
+
 class Initializer:
     @staticmethod
     def use_he_init(module: nn.Module):
@@ -69,6 +130,11 @@ class Trainer:
     train_dataloader, valid_dataloader: yield (inputs, targets) batches (see prepare_batch otherwise).
         For multiple outputs, targets have the same tuple/dict structure (None skips an output),
         or are a single tensor shared by every output.
+        Either can instead be in-memory data as an (X, y) pair of tensors or numpy arrays, e.g.
+        Trainer(model, (X_train, y_train), (X_valid, y_valid), batch_size=64); X and y may also be
+        tuples/dicts of them (several inputs/outputs), all with the same length. It is split into
+        batches of batch_size, reshuffled every epoch for training and kept in order for validation.
+        A list of two (xb, yb) batches is still treated as batches.
     criterion: the loss; a list/dict gives one loss per output, a single loss is applied to every
         output. Default: BCEWithLogitsLoss for one logit per sample, else CrossEntropyLoss
         (single-output models only).
@@ -131,6 +197,8 @@ class Trainer:
         history['train_tar']. The Trainer clears both attributes before and after every training
         forward pass, and a missing one raises an error. Typical values: ar=2, tar=1.
         0 (default): off. Can be changed later through train(ar=..., tar=...).
+    batch_size: batch size for data given as tensors (see train_dataloader); ignored for dataloaders.
+        Also used by evaluate() when it is given tensors.
     """
     def __init__(
             self,
@@ -159,6 +227,7 @@ class Trainer:
             reset_state=None,
             ar=0.0,
             tar=0.0,
+            batch_size=32,
             ):
         self.verbose = verbose
         self.progress = progress
@@ -166,6 +235,9 @@ class Trainer:
         self._set_reset_state(reset_state, model)
         self._set_activation_reg(0.0 if ar is None else ar, 0.0 if tar is None else tar)
         self.channels_last = channels_last
+        self.batch_size = batch_size
+        train_dataloader = self._as_loader(train_dataloader, shuffle=True)
+        valid_dataloader = self._as_loader(valid_dataloader, shuffle=False)
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
         self.prepare_batch = prepare_batch
@@ -258,7 +330,9 @@ class Trainer:
             self._fwd = torch.compile(self.model, mode=compile if isinstance(compile, str) else None)
             if not getattr(train_dataloader, 'drop_last', True):
                 warnings.warn('compile=True without drop_last=True on the train dataloader: '
-                              'the smaller last batch triggers a recompile.')
+                              'the smaller last batch triggers a recompile.' + (
+                              ' (For tensor data, make its length a multiple of batch_size, or pass '
+                              'a DataLoader with drop_last=True.)' if isinstance(train_dataloader, _TensorBatches) else ''))
         else:
             self._fwd = self.model
         self._needs_warmup = bool(compile)
@@ -332,6 +406,15 @@ class Trainer:
         if isinstance(obj, (list, tuple)):
             return type(obj)(self._move(v, channels_last) for v in obj)
         return obj
+
+    def _as_loader(self, data, shuffle):
+        # wraps (X, y) tensors/arrays in batches; dataloaders and other iterables are returned unchanged
+        tensors = _as_tensor_data(data)
+        if tensors is None:
+            return data
+        if not (isinstance(self.batch_size, int) and self.batch_size > 0):
+            raise ValueError(f'batch_size must be a positive int, got {self.batch_size!r}')
+        return _TensorBatches(tensors, self.batch_size, shuffle)
 
     @staticmethod
     def _has_tensor(obj):
@@ -423,7 +506,10 @@ class Trainer:
         except TypeError:
             text = 'unknown number of batches'
         batch_size = getattr(loader, 'batch_size', None)
-        return text + (f' of {batch_size}' if batch_size else '')
+        text += f' of {batch_size}' if batch_size else ''
+        if isinstance(loader, _TensorBatches):
+            text += f' from tensors ({loader.n:,} samples' + (', shuffled)' if loader.shuffle else ')')
+        return text
 
     @staticmethod
     def _describe_spec(spec):
@@ -806,14 +892,15 @@ class Trainer:
     def evaluate(self, dataloader):
         """Evaluate the model on a dataloader without training.
 
-        dataloader: yields batches in the same form as the training data.
+        dataloader: yields batches in the same form as the training data, or (X, y) tensors/arrays,
+            which are split into batches of the Trainer's batch_size.
         Returns the metric value for a single-output model; for multiple outputs, a dict with the
         weighted 'loss' and each output's 'loss/<name>' and 'metric/<name>'.
         """
         if not self._outputs_ready:
             # set up from a train-mode pass, so outputs returned only while training are known
             self._setup_outputs(self._probe(train_mode=True))
-        results = self._evaluate(dataLoader=dataloader)
+        results = self._evaluate(dataLoader=self._as_loader(dataloader, shuffle=False))
         return results['metric'] if self._out_keys is None else results
 
 
