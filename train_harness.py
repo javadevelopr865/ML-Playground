@@ -48,6 +48,90 @@ class Initializer:
 
 
 class Trainer:
+    """Training loop with mixed precision, checkpointing, early stopping and lr scheduling.
+
+    Usage:
+        trainer = Trainer(model, train_dl, valid_dl)
+        trainer.train(n_epochs=10, early_stopping=True)
+        trainer.evaluate(test_dl)
+
+    Main methods:
+        train(...)            train for n epochs, validating each epoch; restores the best checkpoint.
+        train_one_cycle(...)  train() with a temporary OneCycleLR schedule stepped every batch.
+        evaluate(dataloader)  metric (single output) or dict of losses/metrics (multiple outputs).
+        sync_optimizer()      match the optimizer to the model's current parameters (train() calls it).
+    Per-epoch results are kept in .history.
+
+    Constructor arguments:
+    model: the nn.Module to train. If a batch's inputs are a plain tuple they are passed as
+        positional arguments, model(*X); anything else (tensor, dict, list, BatchEncoding) as model(X).
+        The model may return one output, or a tuple/list/dict of outputs.
+    train_dataloader, valid_dataloader: yield (inputs, targets) batches (see prepare_batch otherwise).
+        For multiple outputs, targets have the same tuple/dict structure (None skips an output),
+        or are a single tensor shared by every output.
+    criterion: the loss; a list/dict gives one loss per output, a single loss is applied to every
+        output. Default: BCEWithLogitsLoss for one logit per sample, else CrossEntropyLoss
+        (single-output models only).
+    optimizer: default AdamW(lr=default_lr, weight_decay=weight_decay).
+    metric: a torchmetrics metric; a list/dict gives one per output (None for no metric), a single
+        metric is copied for every output. Default: Accuracy for single-output models, none otherwise.
+    lr_scheduler: stepped every epoch.
+    default_lr, weight_decay: used only for the default optimizer.
+    checkpoint_path: where the best model is saved and reloaded after training;
+        'auto' picks a random file name, None disables checkpointing.
+    device: 'auto' (default; None means the same) keeps a model that is on an accelerator where it is,
+        and moves a cpu model to cuda/mps when available, with a warning; 'model' always keeps the
+        model where it is; anything else ('cpu', 'mps', torch.device(...)) is used as given.
+        A model spread over several devices is never moved by 'auto'/'model'.
+    num_classes: used for the default metric; inferred from the model output if not given.
+    amp: mixed precision on cuda/mps. amp_dtype: default bf16 where supported, else fp16.
+    compile: True or a torch.compile mode string ('reduce-overhead', 'max-autotune').
+    channels_last: use channels_last memory format for the model and 4-D input tensors.
+    prepare_batch: prepare_batch(batch) -> (inputs, targets), applied to every batch before it is
+        moved to the device, e.g. to convert dtypes or split a dict batch.
+    loss_weights: per-output weights for the total loss, as a list/dict matching the outputs;
+        default 1.0 for each output (a sum). Can be changed later through train(loss_weights=...).
+    monitor: what picks the best checkpoint and drives early stopping: 'loss' (the weighted
+        validation loss), 'metric' (single output), or the name/index of an output with a metric.
+        Default: 'metric' for single-output models, 'loss' for multiple outputs.
+    verbose: print a summary of the setup, what is monitored, each epoch's results and which
+        checkpoint was restored. Warnings are shown either way. Can be changed later via .verbose.
+    progress: show tqdm progress bars, one over the epochs and one for each epoch's batches
+        (off when verbose=False or tqdm isn't installed). Can be changed later via .progress.
+    grad_clip: max norm for gradient clipping. After every backward pass, if the total L2 norm of
+        all the gradients exceeds grad_clip, they are all scaled down to that norm (the direction
+        is kept); below it they are left alone. None, 0 or False (default): off. float('inf')
+        never clips but still records the norms, to help choose a value. While it is on, the
+        mean pre-clip norm and the fraction of clipped steps are recorded per epoch in
+        history['train_grad_norm'] and history['train_clipped']. Can be changed later through
+        train(grad_clip=...).
+    reset_state: for stateful models that carry a hidden state from one batch to the next (e.g. an
+        RNN/LSTM trained with truncated backprop through time). True calls model.reset(); a callable
+        is called as reset_state(model). It runs at the start of every pass over a dataloader (each
+        training epoch, each validation, evaluate()) and around the forward passes the Trainer makes
+        to inspect the model's output, so no state leaks between training and validation. None or
+        False (default): never. Not needed for models that start from a fresh hidden state on every
+        call (nn.LSTM called without a hidden state), which already work as they are.
+        The model itself must still:
+          - detach the state between batches (self.h = h.detach()), otherwise the second batch fails
+            with "Trying to backward through the graph a second time";
+          - keep the state in a plain attribute, not a registered buffer, so it stays out of the
+            state_dict and the checkpoints;
+          - handle a smaller last batch, e.g. reset when x.size(0) changes, or use drop_last=True.
+        With compile=True, changing Python attributes inside forward can cause graph breaks/recompiles.
+    ar, tar: activation regularization and temporal activation regularization (AWD-LSTM), for RNNs.
+        On every training batch the model must set, in forward, self.dropped_out (the RNN output
+        after dropout) when ar > 0 and self.raw_out (before dropout) when tar > 0, each a
+        (B, T, H) tensor (batch first) or a list of them, e.g. one per layer. Then
+            ar  * mean(dropped_out ** 2)                                  (summed over the list)
+            tar * mean((raw_out[:, 1:] - raw_out[:, :-1]) ** 2)
+        are added to the loss that is backpropagated. They are computed in float32, during
+        training only, and are not included in the reported train loss, which stays comparable
+        with the valid loss; the penalties are recorded per epoch in history['train_ar'] and
+        history['train_tar']. The Trainer clears both attributes before and after every training
+        forward pass, and a missing one raises an error. Typical values: ar=2, tar=1.
+        0 (default): off. Can be changed later through train(ar=..., tar=...).
+    """
     def __init__(
             self,
             model,
@@ -76,77 +160,6 @@ class Trainer:
             ar=0.0,
             tar=0.0,
             ):
-        """Training loop with mixed precision, checkpointing, early stopping and lr scheduling.
-
-        model: the nn.Module to train. If a batch's inputs are a plain tuple they are passed as
-            positional arguments, model(*X); anything else (tensor, dict, list, BatchEncoding) as model(X).
-            The model may return one output, or a tuple/list/dict of outputs.
-        train_dataloader, valid_dataloader: yield (inputs, targets) batches (see prepare_batch otherwise).
-            For multiple outputs, targets have the same tuple/dict structure (None skips an output),
-            or are a single tensor shared by every output.
-        criterion: the loss; a list/dict gives one loss per output, a single loss is applied to every
-            output. Default: BCEWithLogitsLoss for one logit per sample, else CrossEntropyLoss
-            (single-output models only).
-        optimizer: default AdamW(lr=default_lr, weight_decay=weight_decay).
-        metric: a torchmetrics metric; a list/dict gives one per output (None for no metric), a single
-            metric is copied for every output. Default: Accuracy for single-output models, none otherwise.
-        lr_scheduler: stepped every epoch.
-        default_lr, weight_decay: used only for the default optimizer.
-        checkpoint_path: where the best model is saved and reloaded after training;
-            'auto' picks a random file name, None disables checkpointing.
-        device: 'auto' (default; None means the same) keeps a model that is on an accelerator where it is,
-            and moves a cpu model to cuda/mps when available, with a warning; 'model' always keeps the
-            model where it is; anything else ('cpu', 'mps', torch.device(...)) is used as given.
-            A model spread over several devices is never moved by 'auto'/'model'.
-        num_classes: used for the default metric; inferred from the model output if not given.
-        amp: mixed precision on cuda/mps. amp_dtype: default bf16 where supported, else fp16.
-        compile: True or a torch.compile mode string ('reduce-overhead', 'max-autotune').
-        channels_last: use channels_last memory format for the model and 4-D input tensors.
-        prepare_batch: prepare_batch(batch) -> (inputs, targets), applied to every batch before it is
-            moved to the device, e.g. to convert dtypes or split a dict batch.
-        loss_weights: per-output weights for the total loss, as a list/dict matching the outputs;
-            default 1.0 for each output (a sum). Can be changed later through train(loss_weights=...).
-        monitor: what picks the best checkpoint and drives early stopping: 'loss' (the weighted
-            validation loss), 'metric' (single output), or the name/index of an output with a metric.
-            Default: 'metric' for single-output models, 'loss' for multiple outputs.
-        verbose: print a summary of the setup, what is monitored, each epoch's results and which
-            checkpoint was restored. Warnings are shown either way. Can be changed later via .verbose.
-        progress: show tqdm progress bars, one over the epochs and one for each epoch's batches
-            (off when verbose=False or tqdm isn't installed). Can be changed later via .progress.
-        grad_clip: max norm for gradient clipping. After every backward pass, if the total L2 norm of
-            all the gradients exceeds grad_clip, they are all scaled down to that norm (the direction
-            is kept); below it they are left alone. None, 0 or False (default): off. float('inf')
-            never clips but still records the norms, to help choose a value. While it is on, the
-            mean pre-clip norm and the fraction of clipped steps are recorded per epoch in
-            history['train_grad_norm'] and history['train_clipped']. Can be changed later through
-            train(grad_clip=...).
-        reset_state: for stateful models that carry a hidden state from one batch to the next (e.g. an
-            RNN/LSTM trained with truncated backprop through time). True calls model.reset(); a callable
-            is called as reset_state(model). It runs at the start of every pass over a dataloader (each
-            training epoch, each validation, evaluate()) and around the forward passes the Trainer makes
-            to inspect the model's output, so no state leaks between training and validation. None or
-            False (default): never. Not needed for models that start from a fresh hidden state on every
-            call (nn.LSTM called without a hidden state), which already work as they are.
-            The model itself must still:
-              - detach the state between batches (self.h = h.detach()), otherwise the second batch fails
-                with "Trying to backward through the graph a second time";
-              - keep the state in a plain attribute, not a registered buffer, so it stays out of the
-                state_dict and the checkpoints;
-              - handle a smaller last batch, e.g. reset when x.size(0) changes, or use drop_last=True.
-            With compile=True, changing Python attributes inside forward can cause graph breaks/recompiles.
-        ar, tar: activation regularization and temporal activation regularization (AWD-LSTM), for RNNs.
-            On every training batch the model must set, in forward, self.dropped_out (the RNN output
-            after dropout) when ar > 0 and self.raw_out (before dropout) when tar > 0, each a
-            (B, T, H) tensor (batch first) or a list of them, e.g. one per layer. Then
-                ar  * mean(dropped_out ** 2)                                  (summed over the list)
-                tar * mean((raw_out[:, 1:] - raw_out[:, :-1]) ** 2)
-            are added to the loss that is backpropagated. They are computed in float32, during
-            training only, and are not included in the reported train loss, which stays comparable
-            with the valid loss; the penalties are recorded per epoch in history['train_ar'] and
-            history['train_tar']. The Trainer clears both attributes before and after every training
-            forward pass, and a missing one raises an error. Typical values: ar=2, tar=1.
-            0 (default): off. Can be changed later through train(ar=..., tar=...).
-        """
         self.verbose = verbose
         self.progress = progress
         self._set_grad_clip(grad_clip)

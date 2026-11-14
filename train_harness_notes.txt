@@ -939,3 +939,18 @@ Example:
 
     Trainer(model, train_dl, valid_dl, reset_state=True, ar=2, tar=1)
 
+
+
+======================================================================
+PART 8. CLASS DOCSTRING (2026-11-14)
+======================================================================
+
+Problem: Trainer? in Jupyter (and help(Trainer), editor hover tooltips) showed
+"Docstring: <no docstring>". The full argument documentation was on __init__, which
+IPython only shows further down under "Init docstring", so it was easy to miss.
+
+Change: moved that docstring from __init__ to the class body (re-indented, text
+unchanged) and put a short overview in front of it: a usage example, the public methods
+(train, train_one_cycle, evaluate, sync_optimizer) and where the per-epoch results are
+kept (.history). __init__ no longer has its own docstring, so the text isn't shown twice.
+Documentation only, no behavior change.
