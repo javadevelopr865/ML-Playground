@@ -14,6 +14,7 @@ supersede earlier ones where they disagree; those places are marked.
   PART 7. Activation regularization: ar, tar (2026-11-12)
   PART 8. Class docstring (2026-11-14)
   PART 9. Data as in-memory tensors: (X, y) and batch_size (2026-11-14)
+  PART 10. One reusable batch bar: fixes "model not found" widgets (2026-11-14)
 
 (Parts 2 and 3 were train_harness_sync_optimizer.txt and
 train_harness_batches_and_task_inference.txt.)
@@ -1008,3 +1009,48 @@ all of X, then all of y.
   - No num_workers / pin_memory / drop_last options: use a DataLoader for those.
   - num_classes can't be read from dataset.classes; it is inferred from the model output
     (or pass num_classes=).
+
+
+======================================================================
+PART 10. ONE REUSABLE BATCH BAR: FIXES "MODEL NOT FOUND" WIDGETS (2026-11-14)
+======================================================================
+
+Problem: training cells in Jupyter sometimes showed "Error displaying widget: model not
+found" (seen in ML_notebooks/dating_app_match_xgboost_two_tower.ipynb). Training itself
+was unaffected.
+
+Cause: in a notebook each tqdm bar is an ipywidget: a widget model in the kernel, and an
+output in the cell that only stores the model's id. train() opened a new leave=False bar
+for every training pass and every validation pass, i.e. 1 + 2 * n_epochs widgets per run
+(41 for 20 epochs). A finished leave=False bar closes its widget model, but its output
+stays in the cell. The frontend then shows the error when it draws an output whose model
+is gone:
+  - during the run, when a bar is closed before the frontend has drawn it; validation
+    passes of a few ms make this a race that only happens sometimes;
+  - later, when outputs are redrawn (reopening the notebook without saved widget
+    state, a kernel restart, VS Code re-rendering after scrolling).
+Not specific to train_one_cycle(), which runs the same loop through train().
+
+Change:
+  - train() opens two bars per run (_run_bars): the epochs bar (kept when done, as
+    before) and ONE batch bar (leave=False) kept in self._run_bar.
+  - Every training/validation pass resets that batch bar (_batch_bar): reset(total=
+    len(loader)), set_description('epoch N' / 'valid'), postfix cleared, then
+    bar.update() after each batch. The loop iterates the dataloader itself instead of
+    the tqdm wrapper.
+  - evaluate() called on its own still opens one bar of its own, as before.
+  - self._run_bar is cleared in a finally, so an error or KeyboardInterrupt mid-run
+    doesn't leave a stale bar for the next call.
+  - _NoBar gained reset / set_description / set_postfix_str no-ops.
+
+Checked:
+  - Executed in a real Jupyter kernel (nbclient), a 10-epoch train_one_cycle() cell had
+    21 widget outputs before and 2 after.
+  - 2 bars per train() / train_one_cycle() run (batch bar reset 2 * n_epochs times), 1
+    for evaluate(), 2 with early stopping; none with progress=False, verbose=False or
+    without tqdm; a dataloader without len() works (unknown total).
+  - After an exception mid-run _run_bar is None and the next train() works.
+
+Still possible: when you reopen a saved notebook, the two remaining bars of each run can
+show the same error unless widget state is saved with it (JupyterLab: Settings > Save
+Widget State Automatically). Use progress=False to have no widgets at all.

@@ -32,7 +32,10 @@ class _NoBar:
     def __exit__(self, *exc):
         return False
     def update(self, n=1): pass
+    def reset(self, total=None): pass
+    def set_description(self, desc=None, refresh=True): pass
     def set_postfix(self, *args, **kwargs): pass
+    def set_postfix_str(self, s='', refresh=True): pass
 
 def _map_arrays(fn, obj):
     # applies fn to every tensor in a nested tuple/list/dict, keeping the structure
@@ -339,6 +342,8 @@ class Trainer:
 
         # train_/valid_ loss and metric per epoch; with multiple outputs also per output, e.g. 'valid_metric/aux'
         self.history = {}
+        # the batch bar of the current train() run, reused by every epoch and validation pass
+        self._run_bar = None
 
         if self.verbose:
             # several of these are defaults or guessed from the model's output, so say what was picked
@@ -673,6 +678,36 @@ class Trainer:
     def _bar(self, iterable=None, **kwargs):
         return tqdm(iterable, dynamic_ncols=True, **kwargs) if self._bars_on() else _NoBar(iterable)
 
+    @contextlib.contextmanager
+    def _run_bars(self, n_epochs):
+        # the bars of a train() run: the epochs bar, which stays when done, and one batch bar that every
+        # training/validation pass resets instead of opening its own. In Jupyter each bar is a widget, and
+        # dozens of short-lived ones (a valid pass can take a few ms) left "Error displaying widget: model
+        # not found" in the output when a bar was closed before the frontend had drawn it.
+        with self._bar(total=n_epochs, desc='training', unit='epoch') as epochs_bar, \
+                self._bar(unit='batch', leave=False) as batch_bar:
+            self._run_bar = batch_bar
+            try:
+                yield epochs_bar
+            finally:
+                self._run_bar = None
+
+    @contextlib.contextmanager
+    def _batch_bar(self, dataLoader, desc):
+        # inside train(): the run's batch bar, reset for this pass; otherwise (evaluate()) a bar of its own
+        try:
+            total = len(dataLoader)
+        except TypeError:
+            total = None
+        if self._run_bar is not None:
+            self._run_bar.reset(total=total)
+            self._run_bar.set_description(desc, refresh=False)
+            self._run_bar.set_postfix_str('', refresh=False)
+            yield self._run_bar
+        else:
+            with self._bar(total=total, desc=desc, unit='batch', leave=False) as bar:
+                yield bar
+
     def _print(self, msg):
         # tqdm.write prints above the progress bars instead of breaking them
         (tqdm.write if tqdm is not None else print)(msg)
@@ -795,8 +830,8 @@ class Trainer:
             grad_norm_sum = torch.zeros((), device=self.device)
             n_finite = torch.zeros((), device=self.device)
             n_clipped = torch.zeros((), device=self.device)
-        with self._bar(dataLoader, desc=desc, unit='batch', leave=False) as bar:
-            for batch in bar:
+        with self._batch_bar(dataLoader, desc) as bar:
+            for batch in dataLoader:
                 X, y = self._to_device(batch)
                 if act_reg:
                     self._clear_activations()
@@ -840,6 +875,7 @@ class Trainer:
                     head_losses[k] = head_losses.get(k, 0) + head_loss.detach()
                 self._update_metrics(y_pred, y)
                 n_batches += 1
+                bar.update()
                 if self._bars_on() and n_batches % self._postfix_every == 0:
                     bar.set_postfix(loss=f'{total_loss.item() / n_batches:.4f}')
         if n_batches == 0:
@@ -1014,8 +1050,8 @@ class Trainer:
                     self._check_loss_config()
         best_value = best_epoch = None
         patience_counter = 0
-        # the epochs bar stays when done (e.g. 7/20 after early stopping); the batch bars are removed
-        with self._bar(total=n_epochs, desc='training', unit='epoch') as epochs_bar:
+        # the epochs bar stays when done (e.g. 7/20 after early stopping); the batch bar is removed
+        with self._run_bars(n_epochs) as epochs_bar:
             for epoch in range(n_epochs):
                 self.model.train()
                 t0 = time.time()
